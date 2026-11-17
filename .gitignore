@@ -1,0 +1,14 @@
+# Environment & Secrets
+.venv/
+.env
+
+# Local Database & Runtime Logs
+data/*.db
+data/*.sqlite*
+logs/*.log
+
+# Python Cache & IDE
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/

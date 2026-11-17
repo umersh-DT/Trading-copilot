@@ -1,0 +1,66 @@
+from datetime import datetime
+from typing import Literal, Optional
+from pydantic import BaseModel, Field
+
+
+class ParsedJournalNote(BaseModel):
+    """Structured output schema used by gemini-4-hydrogen to parse raw trade notes."""
+    session: Literal["ASIA", "LONDON", "NEW_YORK", "LONDON_NY_OVERLAP", "UNKNOWN"] = Field(
+        description="Trading session inferred from trade timestamp or user note."
+    )
+    setup_type: str = Field(
+        description="Concise label for the technical setup (e.g., 'London Liquidity Sweep', 'FVG Retest', 'RSI Divergence')."
+    )
+    timeframe: Optional[str] = Field(
+        default=None,
+        description="Execution or confirmation timeframe mentioned (e.g., 'M15', 'H1', 'M5')."
+    )
+    emotional_state: Literal["CALM", "CONFIDENT", "FOMO", "REVENGE", "HESITANT", "FRUSTRATED", "NEUTRAL"] = Field(
+        description="Dominant psychological state detected in the trader's note."
+    )
+    followed_plan: bool = Field(
+        description="True if the trader respected their entry criteria, stop-loss, and risk limits; False if rules were broken."
+    )
+    mistake_tags: list[str] = Field(
+        default_factory=list,
+        description="List of specific execution errors (e.g., 'moved_sl', 'early_entry', 'oversized_lot', 'news_gamble'). Empty if clean execution."
+    )
+    ai_feedback: str = Field(
+        description="Direct, objective 2-sentence coaching critique referencing the trade outcome and discipline."
+    )
+
+
+class DrawdownStatus(BaseModel):
+    """Real-time The5ers High Stakes risk buffer telemetry."""
+    trading_date: str
+    starting_account_balance: float
+    day_reference_level: float = Field(description="Higher of day-start balance or equity per The5ers rules.")
+    current_equity: float
+    daily_loss_limit_usd: float
+    daily_drawdown_remaining_usd: float
+    daily_drawdown_used_pct: float
+    static_drawdown_floor_usd: float
+    static_drawdown_remaining_usd: float
+    static_drawdown_used_pct: float
+    soft_lock_triggered: bool
+    lock_reason: Optional[str] = None
+
+
+class TradeJournalSummary(BaseModel):
+    """Combined trade + journal payload served to the Streamlit dashboard."""
+    mt5_position_id: int
+    symbol: str
+    direction: str
+    volume: float
+    entry_price: float
+    exit_price: Optional[float]
+    net_profit: float
+    r_multiple: Optional[float]
+    open_time: datetime
+    close_time: Optional[datetime]
+    session: Optional[str] = None
+    setup_type: Optional[str] = None
+    emotional_state: Optional[str] = None
+    followed_plan: Optional[bool] = None
+    mistake_tags: list[str] = Field(default_factory=list)
+    ai_feedback: Optional[str] = None

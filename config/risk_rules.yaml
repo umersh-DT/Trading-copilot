@@ -1,0 +1,36 @@
+account:
+  firm: "The5ers"
+  program: "High Stakes"
+  starting_balance: 2500.00  # Update to match your exact tier (e.g., 5000, 10000, 20000, 60000, 100000)
+  currency: "USD"
+
+drawdown_limits:
+  daily_loss_pct: 5.0           # Firm hard breach: 5% of initial daily balance/equity (whichever is higher)
+  daily_soft_lock_pct: 3.5      # Agent warning/lockout buffer before slippage causes a breach
+  max_static_drawdown_pct: 10.0 # Firm hard breach: 10% below starting_balance
+  max_soft_lock_pct: 7.5        # Agent warning threshold for total account drawdown
+
+position_sizing:
+  default_risk_per_trade_pct: 0.5
+  max_risk_per_trade_pct: 1.0
+  max_open_positions: 2
+  max_daily_losses: 2           # Stops revenge trading after 2 consecutive/daily stop-outs
+
+instruments:
+  allowed_symbols:
+    - "XAUUSD"
+    - "EURUSD"
+    - "GBPUSD"
+    - "USDJPY"
+  high_impact_news_buffer_minutes: 30  # Phase 2 & 3 gatekeeper rule around CPI/NFP/FOMC
+
+sessions_utc:
+  asia:
+    start: "00:00"
+    end: "07:00"
+  london:
+    start: "07:00"
+    end: "12:00"
+  new_york:
+    start: "12:00"
+    end: "20:00"
