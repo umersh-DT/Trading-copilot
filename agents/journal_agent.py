@@ -8,11 +8,11 @@ from typing import Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from core.database import SessionLocal, init_db, load_risk_rules
-from core.models import Trade, JournalEntry
-from core.schemas import ParsedJournalNote
+from core.models import Trade, JournalEntry, DailyAccountSnapshot
+from core.schemas import ParsedJournalNote, DebriefTurnResponse, ChatMessage
 
 load_dotenv()
 
@@ -23,7 +23,7 @@ MODEL_ID = "gemini-4-hydrogen"
 
 
 class TradingJournalAgent:
-    """Phase 1 Agent: Parses post-trade notes, computes edge metrics, and diagnoses behavioral leaks."""
+    """Phase 1.5 Agent: Interactive post-trade debrief coach + tool-calling journal analyst."""
 
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
@@ -33,7 +33,6 @@ class TradingJournalAgent:
         self.rules = load_risk_rules()
 
     def _infer_session_hint(self, open_time: datetime) -> str:
-        """Provide UTC timestamp context to help Gemini classify the session accurately."""
         utc_dt = open_time.astimezone(timezone.utc) if open_time.tzinfo else open_time.replace(tzinfo=timezone.utc)
         hour = utc_dt.hour
         if 0 <= hour < 7:
@@ -46,59 +45,8 @@ class TradingJournalAgent:
             return f"{utc_dt.strftime('%H:%M')} UTC (likely NEW_YORK)"
         return f"{utc_dt.strftime('%H:%M')} UTC (off-hours / late NY)"
 
-    def log_trade_note(self, db: Session, mt5_position_id: int, raw_notes: str) -> ParsedJournalNote:
-        """
-        Parse raw trader notes into a structured ParsedJournalNote using gemini-4-hydrogen
-        and upsert the resulting JournalEntry into SQLite.
-        """
-        trade = db.query(Trade).filter(Trade.mt5_position_id == mt5_position_id).first()
-        if not trade:
-            raise ValueError(f"Trade with mt5_position_id={mt5_position_id} not found in database.")
-
-        session_hint = self._infer_session_hint(trade.open_time)
-        max_risk_pct = self.rules["position_sizing"]["max_risk_per_trade_pct"]
-        starting_bal = self.rules["account"]["starting_balance"]
-        max_risk_usd = starting_bal * (max_risk_pct / 100.0)
-
-        risk_violation_context = ""
-        if trade.risk_amount_usd and trade.risk_amount_usd > max_risk_usd * 1.05:
-            risk_violation_context = (
-                f"ALERT: Initial trade risk was ${trade.risk_amount_usd:.2f}, exceeding the "
-                f"max {max_risk_pct}% (${max_risk_usd:.2f}) per-trade limit."
-            )
-
-        prompt = f"""
-You are a strict institutional trading performance coach auditing a trade on a The5ers High Stakes prop account.
-Analyze the trade execution telemetry and the trader's post-trade note below, then extract the structured journal classification.
-
-TRADE TELEMETRY:
-- Symbol: {trade.symbol}
-- Direction: {trade.direction}
-- Volume: {trade.volume} lots
-- Entry: {trade.entry_price} | Exit: {trade.exit_price} | Stop Loss: {trade.stop_loss}
-- Open Time: {session_hint}
-- Net PnL: ${trade.net_profit:.2f}
-- Realized R-Multiple: {trade.r_multiple if trade.r_multiple is not None else 'Unknown (No SL recorded)'}
-- {risk_violation_context}
-
-TRADER'S RAW NOTE:
-\"\"\"{raw_notes}\"\"\"
-"""
-
-        response = self.client.models.generate_content(
-            model=MODEL_ID,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ParsedJournalNote,
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
-                temperature=0.1,
-            ),
-        )
-
-        parsed = ParsedJournalNote.model_validate_json(response.text)
-
-        # Upsert JournalEntry in SQLite
+    def _save_parsed_entry(self, db: Session, trade: Trade, raw_notes: str, parsed: ParsedJournalNote) -> None:
+        """Persist or update a finalized JournalEntry in SQLite."""
         entry = db.query(JournalEntry).filter(JournalEntry.trade_id == trade.id).first()
         if entry:
             entry.session = parsed.session
@@ -122,16 +70,134 @@ TRADER'S RAW NOTE:
                 ai_feedback=parsed.ai_feedback,
             )
             db.add(entry)
-
         db.commit()
-        logger.info(f"Logged journal entry for MT5 Position #{mt5_position_id} | Setup: {parsed.setup_type}")
+
+    def log_trade_note(self, db: Session, mt5_position_id: int, raw_notes: str) -> ParsedJournalNote:
+        """One-shot structured extraction (kept for quick logging or batch imports)."""
+        trade = db.query(Trade).filter(Trade.mt5_position_id == mt5_position_id).first()
+        if not trade:
+            raise ValueError(f"Trade with mt5_position_id={mt5_position_id} not found.")
+
+        session_hint = self._infer_session_hint(trade.open_time)
+        prompt = f"""
+You are a strict institutional trading coach auditing a trade on a The5ers High Stakes prop account.
+Extract the structured journal classification from the telemetry and trader note below.
+
+TRADE TELEMETRY:
+- Symbol: {trade.symbol} | Direction: {trade.direction} | Volume: {trade.volume} lots
+- Entry: {trade.entry_price} | Exit: {trade.exit_price} | Stop Loss: {trade.stop_loss}
+- Open Time: {session_hint}
+- Net PnL: ${trade.net_profit:.2f} | Realized R-Multiple: {trade.r_multiple}
+
+TRADER NOTE:
+\"\"\"{raw_notes}\"\"\"
+"""
+        response = self.client.models.generate_content(
+            model=MODEL_ID,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ParsedJournalNote,
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+                temperature=0.1,
+            ),
+        )
+        parsed = ParsedJournalNote.model_validate_json(response.text)
+        self._save_parsed_entry(db, trade, raw_notes, parsed)
         return parsed
+
+    def run_debrief_turn(
+        self,
+        db: Session,
+        mt5_position_id: int,
+        conversation: list[ChatMessage],
+        force_finalize: bool = False,
+    ) -> DebriefTurnResponse:
+        """
+        Interactive multi-turn post-trade interview.
+        - Turn 0 (empty conversation): Coach inspects MT5 telemetry and asks 1-2 targeted opening questions.
+        - Subsequent turns: Evaluates trader answers; asks 1 follow-up if vague, or finalizes & saves JournalEntry.
+        """
+        trade = db.query(Trade).filter(Trade.mt5_position_id == mt5_position_id).first()
+        if not trade:
+            raise ValueError(f"Trade with mt5_position_id={mt5_position_id} not found.")
+
+        session_hint = self._infer_session_hint(trade.open_time)
+        max_risk_pct = self.rules["position_sizing"]["max_risk_per_trade_pct"]
+        starting_bal = self.rules["account"]["starting_balance"]
+        max_risk_usd = starting_bal * (max_risk_pct / 100.0)
+
+        risk_flag = "Within 1% max risk limit."
+        if trade.risk_amount_usd and trade.risk_amount_usd > max_risk_usd * 1.05:
+            risk_flag = f"VIOLATION: Initial risk ${trade.risk_amount_usd:.2f} exceeded {max_risk_pct}% (${max_risk_usd:.2f}) cap."
+        elif not trade.stop_loss:
+            risk_flag = "WARNING: No Stop Loss recorded on MT5 deal comment."
+
+        user_turns = [m for m in conversation if m.role == "user"]
+        must_complete = force_finalize or len(user_turns) >= 2
+
+        system_instruction = f"""
+You are a sharp, no-nonsense trading performance coach conducting a post-trade debrief for a The5ers High Stakes trader.
+Your goal is to uncover the exact setup trigger, execution discipline, and emotional state behind this trade in 1-2 short turns—never interrogate endlessly.
+
+TRADE TELEMETRY:
+- MT5 Position ID: #{trade.mt5_position_id}
+- Symbol: {trade.symbol} | Direction: {trade.direction} | Volume: {trade.volume} lots
+- Entry: {trade.entry_price} | Exit: {trade.exit_price} | Stop Loss: {trade.stop_loss}
+- Open Time: {session_hint}
+- Net PnL: ${trade.net_profit:+.2f} | Realized R-Multiple: {trade.r_multiple if trade.r_multiple is not None else 'N/A'}
+- Risk Audit: {risk_flag}
+
+RULES FOR THIS TURN:
+1. If the conversation has 0 user messages, set status='ASKING_FOLLOWUP' and ask 2 concise, specific questions based on the telemetry (e.g., if it was a loss or had no SL, ask what invalidated the setup or why SL wasn't set; if a win, ask what confirmation triggered entry and whether exit followed plan).
+2. If the trader has answered clearly OR must_complete={must_complete}, set status='COMPLETED', populate 'final_entry' completely, and write a crisp 2-sentence coaching takeaway in 'coach_message'.
+3. Only set status='ASKING_FOLLOWUP' after 1 user turn if the trader gave a one-word/vague answer (e.g., "good setup" or "got stopped").
+"""
+
+        contents = []
+        if not conversation:
+            contents.append("Start the post-trade debrief for this MT5 execution.")
+        else:
+            for msg in conversation:
+                contents.append(
+                    types.Content(
+                        role=msg.role,
+                        parts=[types.Part.from_text(text=msg.content)],
+                    )
+                )
+
+        response = self.client.models.generate_content(
+            model=MODEL_ID,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=DebriefTurnResponse,
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+                temperature=0.2,
+            ),
+        )
+
+        result = DebriefTurnResponse.model_validate_json(response.text)
+
+        # Compile full transcript safely and persist to SQLite once completed
+        if result.status == "COMPLETED" and result.final_entry is not None:
+            lines = []
+            for m in conversation:
+                speaker = "Coach" if m.role == "model" else "Trader"
+                lines.append(f"{speaker}: {m.content}")
+            transcript = "\n".join(lines)
+            self._save_parsed_entry(db, trade, raw_notes=transcript, parsed=result.final_entry)
+            logger.info(f"Completed interactive debrief for MT5 #{mt5_position_id}")
+
+        return result
 
     def compute_performance_metrics(self, db: Session, lookback_days: int = 30) -> dict:
         """Compute deterministic win rates, expectancy, R-multiples, and mistake frequencies."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         trades = (
             db.query(Trade)
+            .options(joinedload(Trade.journal_entry))
             .filter(Trade.status == "CLOSED", Trade.close_time >= cutoff)
             .order_by(Trade.close_time.asc())
             .all()
@@ -197,11 +263,118 @@ TRADER'S RAW NOTE:
             "top_mistakes": dict(mistake_counter.most_common(10)),
         }
 
+    def chat_with_journal(self, db: Session, messages: list[ChatMessage], lookback_days: int = 60) -> str:
+        """
+        Natural-language Q&A over the trader's SQLite journal using automatic Python tool calling.
+        gemini-4-hydrogen queries exact trade rows, metrics, and drawdown snapshots before answering.
+        """
+
+        def get_performance_summary(days: int = lookback_days) -> dict:
+            """Return win rates, net PnL, average R, and breakdowns by symbol, session, setup, emotion, and plan adherence."""
+            return self.compute_performance_metrics(db, lookback_days=days)
+
+        def search_trades(
+            symbol: Optional[str] = None,
+            session: Optional[str] = None,
+            outcome: Optional[str] = None,
+            followed_plan: Optional[bool] = None,
+            limit: int = 15,
+        ) -> list[dict]:
+            """
+            Query individual closed trades from the database with optional filters.
+            Args:
+                symbol: Filter by instrument such as 'XAUUSD' or 'EURUSD'.
+                session: Filter by session ('ASIA', 'LONDON', 'NEW_YORK', 'LONDON_NY_OVERLAP').
+                outcome: Filter by 'WIN' (net_profit > 0) or 'LOSS' (net_profit < 0).
+                followed_plan: Filter by True or False.
+                limit: Max number of recent trades to return (default 15).
+            """
+            q = db.query(Trade).options(joinedload(Trade.journal_entry)).filter(Trade.status == "CLOSED")
+            if symbol:
+                q = q.filter(Trade.symbol == symbol.upper())
+            if outcome and outcome.upper() == "WIN":
+                q = q.filter(Trade.net_profit > 0)
+            elif outcome and outcome.upper() == "LOSS":
+                q = q.filter(Trade.net_profit < 0)
+
+            rows = q.order_by(Trade.close_time.desc()).limit(100).all()
+            filtered = []
+            for t in rows:
+                je = t.journal_entry
+                if session and (not je or (je.session or "").upper() != session.upper()):
+                    continue
+                if followed_plan is not None and (not je or je.followed_plan != followed_plan):
+                    continue
+                filtered.append(
+                    {
+                        "mt5_id": t.mt5_position_id,
+                        "symbol": t.symbol,
+                        "direction": t.direction,
+                        "volume": t.volume,
+                        "net_profit": t.net_profit,
+                        "r_multiple": t.r_multiple,
+                        "close_time": t.close_time.isoformat() if t.close_time else None,
+                        "session": je.session if je else "UNJOURNALED",
+                        "setup_type": je.setup_type if je else None,
+                        "emotional_state": je.emotional_state if je else None,
+                        "followed_plan": je.followed_plan if je else None,
+                        "mistake_tags": je.mistake_tags if je else [],
+                        "ai_feedback": je.ai_feedback if je else None,
+                    }
+                )
+                if len(filtered) >= limit:
+                    break
+            return filtered
+
+        def get_the5ers_risk_status() -> dict:
+            """Return current The5ers High Stakes account rules and latest daily/static drawdown buffer snapshot."""
+            snap = (
+                db.query(DailyAccountSnapshot)
+                .order_by(DailyAccountSnapshot.trading_date.desc())
+                .first()
+            )
+            return {
+                "firm_rules": self.rules,
+                "latest_snapshot": {
+                    "trading_date": snap.trading_date,
+                    "current_equity": snap.current_equity,
+                    "daily_drawdown_used_pct": snap.daily_drawdown_used_pct,
+                    "static_drawdown_used_pct": snap.static_drawdown_used_pct,
+                    "is_locked_out": snap.is_locked_out,
+                }
+                if snap
+                else "No MT5 snapshot synced yet.",
+            }
+
+        system_instruction = (
+            "You are the trader's quantitative performance analyst and discipline coach for a The5ers High Stakes account. "
+            "Always call the provided database tools to retrieve exact trade numbers before answering questions about performance, "
+            "win rates, sessions, symbols, or drawdown buffers. Cite specific MT5 position IDs, dollar amounts, and R-multiples. "
+            "Be direct, candid, and actionable."
+        )
+
+        contents = [
+            types.Content(
+                role=m.role,
+                parts=[types.Part.from_text(text=m.content)],
+            )
+            for m in messages
+        ]
+
+        response = self.client.models.generate_content(
+            model=MODEL_ID,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=[get_performance_summary, search_trades, get_the5ers_risk_status],
+                thinking_config=types.ThinkingConfig(thinking_level="medium"),
+                temperature=0.2,
+            ),
+        )
+        return response.text or "No response generated."
+
     def run_leak_audit(self, db: Session, lookback_days: int = 30) -> str:
-        """
-        Use gemini-4-hydrogen with high thinking depth to diagnose edge decay,
-        session leaks, and psychological triggers hurting The5ers account progression.
-        """
+        """Deep diagnostic report across all recent trades."""
         metrics = self.compute_performance_metrics(db, lookback_days=lookback_days)
         if metrics.get("total_trades") == 0:
             return "No closed trades available yet. Sync MT5 trades and log notes before running an audit."
@@ -221,7 +394,6 @@ Deliver your audit in three structured sections:
 2. **Primary Capital Leaks (Where Money is Lost):** Pinpoint negative-expectancy sessions, emotional triggers (FOMO/Revenge), or rule violations draining PnL.
 3. **Actionable Rule Adjustments for Next Week:** Give 3 concrete, enforceable rules to feed into the Phase 3 Discipline Gatekeeper.
 """
-
         response = self.client.models.generate_content(
             model=MODEL_ID,
             contents=prompt,
@@ -231,25 +403,3 @@ Deliver your audit in three structured sections:
             ),
         )
         return response.text
-
-
-if __name__ == "__main__":
-    init_db()
-    db = SessionLocal()
-    try:
-        agent = TradingJournalAgent()
-        latest_trade = db.query(Trade).order_by(Trade.close_time.desc()).first()
-        if latest_trade:
-            sample_note = (
-                "Entered short on London session liquidity sweep above Asian high on M15. "
-                "Waited for displacement candle, kept risk tight at 0.5%, and held cleanly to target."
-            )
-            result = agent.log_trade_note(db, latest_trade.mt5_position_id, sample_note)
-            print("\n=== Parsed Journal Entry ===")
-            print(result.model_dump_json(indent=2))
-            print("\n=== Performance Metrics ===")
-            print(json.dumps(agent.compute_performance_metrics(db), indent=2))
-        else:
-            print("Database has 0 trades. Run `python -m connectors.mt5_sync` first.")
-    finally:
-        db.close()

@@ -8,7 +8,14 @@ from sqlalchemy.orm import Session, joinedload
 
 from core.database import init_db, get_db, load_risk_rules
 from core.models import Trade, DailyAccountSnapshot
-from core.schemas import DrawdownStatus, ParsedJournalNote, TradeJournalSummary
+from core.schemas import (
+    DrawdownStatus,
+    ParsedJournalNote,
+    TradeJournalSummary,
+    ChatMessage,
+    DebriefTurnResponse,
+    JournalChatRequest,
+)
 from connectors.mt5_sync import MT5SyncConnector
 from agents.journal_agent import TradingJournalAgent
 
@@ -25,13 +32,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="The5ers Multi-Agent Trading Co-Pilot API",
-    version="1.0.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
 
 class JournalNoteRequest(BaseModel):
     raw_notes: str = Field(..., min_length=3, description="Unstructured post-trade reflection or execution notes.")
+
+
+class DebriefTurnRequest(BaseModel):
+    conversation: list[ChatMessage] = Field(default_factory=list)
+    force_finalize: bool = False
+
+
+class JournalChatResponse(BaseModel):
+    reply: str
 
 
 class SyncResponse(BaseModel):
@@ -46,7 +62,7 @@ class AuditResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "phase": "Phase 1 - Journal & Telemetry"}
+    return {"status": "ok", "phase": "Phase 1.5 - Interactive Journal & Telemetry"}
 
 
 @app.post("/sync/mt5", response_model=SyncResponse)
@@ -83,7 +99,6 @@ def get_drawdown_status(db: Session = Depends(get_db)):
     )
 
     if not snapshot:
-        # Return baseline clean state before first MT5 sync
         daily_limit_usd = round(starting_balance * (daily_limit_pct / 100.0), 2)
         static_floor_usd = round(starting_balance * (1.0 - static_limit_pct / 100.0), 2)
         return DrawdownStatus(
@@ -171,7 +186,7 @@ def list_trades(
 
 @app.post("/trades/{mt5_position_id}/journal", response_model=ParsedJournalNote)
 def submit_trade_note(mt5_position_id: int, payload: JournalNoteRequest, db: Session = Depends(get_db)):
-    """Send raw trade notes to gemini-4-hydrogen for structured tagging and AI coaching feedback."""
+    """One-shot note parsing with gemini-4-hydrogen."""
     try:
         agent = TradingJournalAgent()
         return agent.log_trade_note(db, mt5_position_id=mt5_position_id, raw_notes=payload.raw_notes)
@@ -180,6 +195,36 @@ def submit_trade_note(mt5_position_id: int, payload: JournalNoteRequest, db: Ses
     except Exception as exc:
         logger.exception("Failed to parse journal note with Gemini")
         raise HTTPException(status_code=500, detail=f"Gemini agent error: {exc}")
+
+
+@app.post("/trades/{mt5_position_id}/debrief", response_model=DebriefTurnResponse)
+def interactive_trade_debrief(mt5_position_id: int, payload: DebriefTurnRequest, db: Session = Depends(get_db)):
+    """Multi-turn post-trade coaching interview that saves the structured JournalEntry upon completion."""
+    try:
+        agent = TradingJournalAgent()
+        return agent.run_debrief_turn(
+            db,
+            mt5_position_id=mt5_position_id,
+            conversation=payload.conversation,
+            force_finalize=payload.force_finalize,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Interactive debrief failed")
+        raise HTTPException(status_code=500, detail=f"Debrief error: {exc}")
+
+
+@app.post("/journal/chat", response_model=JournalChatResponse)
+def chat_with_journal(payload: JournalChatRequest, db: Session = Depends(get_db)):
+    """Conversational Q&A backed by Gemini function calling over the trader's SQLite journal."""
+    try:
+        agent = TradingJournalAgent()
+        reply = agent.chat_with_journal(db, messages=payload.messages, lookback_days=payload.lookback_days)
+        return JournalChatResponse(reply=reply)
+    except Exception as exc:
+        logger.exception("Journal chat failed")
+        raise HTTPException(status_code=500, detail=f"Journal chat error: {exc}")
 
 
 @app.get("/analytics/metrics")

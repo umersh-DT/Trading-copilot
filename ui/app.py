@@ -8,7 +8,7 @@ import streamlit as st
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(
-    page_title="The5ers Trading Co-Pilot | Phase 1",
+    page_title="The5ers Trading Co-Pilot | Phase 1.5",
     page_icon="📈",
     layout="wide",
 )
@@ -70,7 +70,7 @@ def render_drawdown_gauge(title: str, used_pct: float, soft_limit: float, hard_l
 # --- Sidebar Controls ---
 with st.sidebar:
     st.title("⚡ Co-Pilot Controls")
-    st.caption("Phase 1: MT5 Sync & Gemini Journal")
+    st.caption("Phase 1.5: Interactive MT5 & Gemini Journal")
 
     lookback_days = st.slider("History Lookback (Days)", min_value=7, max_value=180, value=30, step=1)
 
@@ -89,7 +89,7 @@ with st.sidebar:
 
 
 # --- Header & Live Drawdown Gauges ---
-st.title("The5ers High Stakes — Trading Journal & Risk Telemetry")
+st.title("The5ers High Stakes — Interactive Trading Journal & Risk Telemetry")
 
 dd_status, dd_err = api_get("/account/drawdown")
 if dd_err:
@@ -132,8 +132,8 @@ with g2:
 st.divider()
 
 # --- Main Tabs ---
-tab_journal, tab_analytics, tab_audit = st.tabs(
-    ["📓 Trade Log & AI Journaling", "📊 Edge & Session Analytics", "🧠 Behavioral Leak Audit"]
+tab_journal, tab_chat, tab_analytics, tab_audit = st.tabs(
+    ["📓 Trade Log & AI Debrief", "💬 Chat With Journal", "📊 Edge & Session Analytics", "🧠 Behavioral Leak Audit"]
 )
 
 trades_data, trades_err = api_get("/trades", params={"limit": 200, "symbol": symbol_filter})
@@ -172,7 +172,6 @@ with tab_journal:
                 },
             )
 
-            # Cumulative PnL Equity Curve
             df_sorted = df.sort_values("close_time")
             df_sorted["cum_pnl"] = df_sorted["net_profit"].cumsum()
             fig_eq = px.line(
@@ -187,44 +186,119 @@ with tab_journal:
             st.plotly_chart(fig_eq, width="stretch")
 
     with right_col:
-        st.subheader("Log Post-Trade Note (`gemini-4-hydrogen`)")
-        if trades_data:
+        st.subheader("Interactive Post-Trade Debrief")
+        if not trades_data:
+            st.info("Sync MT5 trades on the left to start an interactive coaching debrief.")
+        else:
             trade_options = {
                 f"#{t['mt5_position_id']} | {t['symbol']} {t['direction']} (${t['net_profit']:+.2f})": t
                 for t in trades_data
             }
-            selected_label = st.selectbox("Select Trade to Annotate", list(trade_options.keys()))
+            selected_label = st.selectbox("Select Trade to Debrief", list(trade_options.keys()))
             selected_trade = trade_options[selected_label]
+            pos_id = selected_trade["mt5_position_id"]
 
             if selected_trade.get("ai_feedback"):
                 st.success(
-                    f"**Existing AI Feedback ({selected_trade['setup_type']} | {selected_trade['emotional_state']}):**\n\n"
+                    f"**Saved Journal Tag:** `{selected_trade['setup_type']}` | "
+                    f"Session: `{selected_trade['session']}` | Emotion: `{selected_trade['emotional_state']}`\n\n"
                     f"{selected_trade['ai_feedback']}"
                 )
 
-            with st.form("journal_note_form"):
-                raw_note = st.text_area(
-                    "Your Trade Notes (Setup, Confirmation, Psychology, Mistakes)",
-                    height=150,
-                    placeholder="E.g., Took XAUUSD short at London open after sweep of Asian high on M15. Waited for BOS, risked 0.5%, trailed stop cleanly.",
-                )
-                submitted = st.form_submit_button("Analyze & Save to Journal", type="primary", width="stretch")
+            debrief_key = f"debrief_history_{pos_id}"
+            if debrief_key not in st.session_state:
+                st.session_state[debrief_key] = []
 
-                if submitted:
-                    if len(raw_note.strip()) < 5:
-                        st.warning("Please enter a slightly more detailed trade note.")
+            col_b1, col_b2 = st.columns(2)
+            if col_b1.button("🎙️ Start / Reset Debrief", width="stretch"):
+                with st.spinner("Coach is reviewing MT5 execution telemetry..."):
+                    res, err = api_post(f"/trades/{pos_id}/debrief", json_body={"conversation": []})
+                    if err:
+                        st.error(err)
                     else:
-                        with st.spinner("gemini-4-hydrogen is extracting setup tags & grading discipline..."):
-                            parsed, err = api_post(
-                                f"/trades/{selected_trade['mt5_position_id']}/journal",
-                                json_body={"raw_notes": raw_note},
+                        st.session_state[debrief_key] = [{"role": "model", "content": res["coach_message"]}]
+                        st.rerun()
+
+            if st.session_state[debrief_key]:
+                if col_b2.button("✅ Finalize & Save Now", width="stretch"):
+                    with st.spinner("Saving structured journal entry..."):
+                        res, err = api_post(
+                            f"/trades/{pos_id}/debrief",
+                            json_body={"conversation": st.session_state[debrief_key], "force_finalize": True},
+                        )
+                        if err:
+                            st.error(err)
+                        else:
+                            st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
+                            st.success("Journal entry saved to SQLite!")
+                            st.rerun()
+
+                for msg in st.session_state[debrief_key]:
+                    with st.chat_message("assistant" if msg["role"] == "model" else "user"):
+                        st.write(msg["content"])
+
+                with st.form(f"debrief_reply_form_{pos_id}", clear_on_submit=True):
+                    trader_reply = st.text_input("Your answer to the coach...")
+                    send_reply = st.form_submit_button("Send Reply", type="primary", width="stretch")
+                    if send_reply and trader_reply.strip():
+                        st.session_state[debrief_key].append({"role": "user", "content": trader_reply.strip()})
+                        with st.spinner("Coach is analyzing your response..."):
+                            res, err = api_post(
+                                f"/trades/{pos_id}/debrief",
+                                json_body={"conversation": st.session_state[debrief_key]},
                             )
                             if err:
-                                st.error(f"Error: {err}")
+                                st.error(err)
                             else:
-                                st.success("Journal entry saved!")
-                                st.json(parsed)
+                                st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
+                                if res["status"] == "COMPLETED":
+                                    st.toast("Debrief complete — JournalEntry saved!", icon="✅")
                                 st.rerun()
+
+with tab_chat:
+    st.subheader("Interrogate Your Trading Journal (`gemini-4-hydrogen` + SQLite Tools)")
+    st.caption("Ask questions about your win rates, emotional leaks, XAU/USD vs. EUR/USD edge, or The5ers drawdown buffer.")
+
+    if "journal_chat_messages" not in st.session_state:
+        st.session_state.journal_chat_messages = []
+
+    quick_prompts = [
+        "Compare my win rate and net PnL when I follow my plan vs. when I break it.",
+        "Which session and instrument has my highest expectancy over the last 30 days?",
+        "Show my last 5 losing trades and summarize the recurring mistake tags.",
+    ]
+    q_cols = st.columns(3)
+    for idx, qp in enumerate(quick_prompts):
+        if q_cols[idx].button(qp, key=f"qp_{idx}", width="stretch"):
+            st.session_state.journal_chat_messages.append({"role": "user", "content": qp})
+            with st.spinner("Querying SQLite journal..."):
+                res, err = api_post(
+                    "/journal/chat",
+                    json_body={"messages": st.session_state.journal_chat_messages, "lookback_days": lookback_days},
+                )
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.journal_chat_messages.append({"role": "model", "content": res["reply"]})
+            st.rerun()
+
+    for m in st.session_state.journal_chat_messages:
+        with st.chat_message("assistant" if m["role"] == "model" else "user"):
+            st.markdown(m["content"])
+
+    user_prompt = st.chat_input("Ask anything about your trades, sessions, setups, or The5ers risk...")
+    if user_prompt:
+        st.session_state.journal_chat_messages.append({"role": "user", "content": user_prompt})
+        with st.spinner("Querying your trade history..."):
+            res, err = api_post(
+                "/journal/chat",
+                json_body={"messages": st.session_state.journal_chat_messages, "lookback_days": lookback_days},
+            )
+            if err:
+                st.error(err)
+            else:
+                st.session_state.journal_chat_messages.append({"role": "model", "content": res["reply"]})
+        st.rerun()
 
 with tab_analytics:
     metrics, m_err = api_get("/analytics/metrics", params={"lookback_days": lookback_days})
@@ -275,7 +349,7 @@ with tab_analytics:
                 )
                 st.plotly_chart(fig_emo, width="stretch")
             else:
-                st.info("Log a post-trade note in the Journal tab to unlock Emotional State analytics.")
+                st.info("Complete an AI debrief in the Journal tab to unlock Emotional State analytics.")
 
         if metrics.get("top_mistakes"):
             st.subheader("Top Execution Mistakes")

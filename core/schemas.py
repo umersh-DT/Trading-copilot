@@ -64,3 +64,28 @@ class TradeJournalSummary(BaseModel):
     followed_plan: Optional[bool] = None
     mistake_tags: list[str] = Field(default_factory=list)
     ai_feedback: Optional[str] = None
+class ChatMessage(BaseModel):
+    """Single turn in a debrief or journal-chat conversation."""
+    role: Literal["user", "model"]
+    content: str
+
+
+class DebriefTurnResponse(BaseModel):
+    """Structured output returned by gemini-4-hydrogen during a post-trade debrief interview."""
+    status: Literal["ASKING_FOLLOWUP", "COMPLETED"] = Field(
+        description="Use 'ASKING_FOLLOWUP' if critical context (setup trigger, invalidation, or emotion) is still unclear; 'COMPLETED' once ready to save."
+    )
+    coach_message: str = Field(
+        description="Either 1-2 sharp coaching questions for the trader, or a concise closing summary when status is COMPLETED."
+    )
+    final_entry: Optional[ParsedJournalNote] = Field(
+        default=None,
+        description="Populated ONLY when status is 'COMPLETED'."
+    )
+
+
+class JournalChatRequest(BaseModel):
+    """Payload for natural-language Q&A against the trader's SQLite journal."""
+    messages: list[ChatMessage]
+    lookback_days: int = Field(default=60, ge=1, le=365)
+    
