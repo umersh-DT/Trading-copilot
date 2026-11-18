@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 import requests
 import pandas as pd
 import plotly.express as px
@@ -8,7 +9,7 @@ import streamlit as st
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(
-    page_title="The5ers Trading Co-Pilot | Phase 1.5",
+    page_title="The5ers Trading Co-Pilot | Phase 2",
     page_icon="📈",
     layout="wide",
 )
@@ -25,12 +26,21 @@ def api_get(path: str, params: dict | None = None):
 
 def api_post(path: str, json_body: dict | None = None, params: dict | None = None):
     try:
-        resp = requests.post(f"{API_BASE_URL}{path}", json=json_body, params=params, timeout=90)
+        resp = requests.post(f"{API_BASE_URL}{path}", json=json_body, params=params, timeout=120)
         resp.raise_for_status()
         return resp.json(), None
     except requests.HTTPError as e:
         detail = e.response.json().get("detail", str(e)) if e.response is not None else str(e)
         return None, detail
+    except Exception as e:
+        return None, str(e)
+
+
+def api_delete(path: str):
+    try:
+        resp = requests.delete(f"{API_BASE_URL}{path}", timeout=30)
+        resp.raise_for_status()
+        return resp.json(), None
     except Exception as e:
         return None, str(e)
 
@@ -67,10 +77,20 @@ def render_drawdown_gauge(title: str, used_pct: float, soft_limit: float, hard_l
     return fig
 
 
+def bias_badge(bias: str) -> str:
+    mapping = {
+        "BULLISH": "🟢 BULLISH",
+        "BEARISH": "🔴 BEARISH",
+        "NEUTRAL": "⚪ NEUTRAL",
+        "VOLATILE_CHOP": "🟠 VOLATILE CHOP",
+    }
+    return mapping.get(bias, bias)
+
+
 # --- Sidebar Controls ---
 with st.sidebar:
     st.title("⚡ Co-Pilot Controls")
-    st.caption("Phase 1.5: Interactive MT5 & Gemini Journal")
+    st.caption("Phase 2: Interactive Journal & Macro Radar")
 
     lookback_days = st.slider("History Lookback (Days)", min_value=7, max_value=180, value=30, step=1)
 
@@ -83,13 +103,23 @@ with st.sidebar:
                 st.success(f"Synced {sync_data['trades_synced']} trades!")
                 st.rerun()
 
+    if st.button("🌍 Refresh Macro & Calendar", width="stretch"):
+        with st.spinner("Scanning live DXY, yields, Fed/ECB & red-folder calendar via Google Search..."):
+            macro_res, m_err = api_post("/macro/refresh")
+            if m_err:
+                st.error(f"Macro scan failed: {m_err}")
+            else:
+                st.success(f"Updated regime ({macro_res['events_upserted']} events)!")
+                st.rerun()
+
     st.divider()
     symbol_filter = st.selectbox("Filter Instrument", ["ALL", "XAUUSD", "EURUSD", "GBPUSD", "USDJPY"])
+    st.caption(f"Current UTC: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}`")
     st.info("Active Model: `gemini-4-hydrogen`\nFirm: **The5ers High Stakes**")
 
 
-# --- Header & Live Drawdown Gauges ---
-st.title("The5ers High Stakes — Interactive Trading Journal & Risk Telemetry")
+# --- Header, News Blackout Banner & Live Drawdown Gauges ---
+st.title("The5ers High Stakes — Multi-Agent Trading Co-Pilot")
 
 dd_status, dd_err = api_get("/account/drawdown")
 if dd_err:
@@ -97,7 +127,14 @@ if dd_err:
     st.stop()
 
 if dd_status["soft_lock_triggered"]:
-    st.error(f"🚨 **CIRCUIT BREAKER TRIGGERED:** {dd_status['lock_reason']} Stop trading for the session.")
+    st.error(f"🚨 **DRAWDOWN CIRCUIT BREAKER TRIGGERED:** {dd_status['lock_reason']} Stop trading for the session.")
+
+blackout_status, _ = api_get("/macro/blackout", params={"symbol": symbol_filter})
+if blackout_status:
+    if blackout_status["is_blackout_active"]:
+        st.error(f"🛑 **{blackout_status['message']}**")
+    else:
+        st.success(f"🟢 **{blackout_status['message']}**")
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 col_m1.metric("Current Equity", f"${dd_status['current_equity']:,.2f}", f"Ref: ${dd_status['day_reference_level']:,.2f}")
@@ -131,11 +168,132 @@ with g2:
 
 st.divider()
 
-# --- Main Tabs ---
-tab_journal, tab_chat, tab_analytics, tab_audit = st.tabs(
-    ["📓 Trade Log & AI Debrief", "💬 Chat With Journal", "📊 Edge & Session Analytics", "🧠 Behavioral Leak Audit"]
+# --- Main Tabs (Phase 1 + Phase 1.5 + Phase 2) ---
+tab_macro, tab_journal, tab_chat, tab_analytics, tab_audit = st.tabs(
+    [
+        "🌍 Macro & News Radar",
+        "📓 Trade Log & AI Debrief",
+        "💬 Chat With Journal",
+        "📊 Edge & Session Analytics",
+        "🧠 Behavioral Leak Audit",
+    ]
 )
 
+# ==============================================================================
+# TAB 1: PHASE 2 MACRO & NEWS RADAR
+# ==============================================================================
+with tab_macro:
+    macro_data, macro_err = api_get("/macro/latest")
+    if macro_err:
+        st.error(f"Could not load macro state: {macro_err}")
+    else:
+        snap = macro_data.get("snapshot")
+        events = macro_data.get("events", [])
+
+        top_m1, top_m2 = st.columns([3, 1])
+        with top_m1:
+            st.subheader("Live Macro Regime & Central Bank Bias")
+            if snap:
+                st.caption(f"Last Grounded Scan: `{snap['updated_at']}`")
+            else:
+                st.info("No macro scan saved yet. Click **🌍 Refresh Macro & Calendar** to run a live grounded search.")
+        with top_m2:
+            if st.button("🔄 Run Grounded Scan Now", type="primary", width="stretch"):
+                with st.spinner("Searching DXY, 10Y yields, Fed/ECB & economic calendar..."):
+                    res, err = api_post("/macro/refresh")
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+
+        if snap:
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Macro Regime", snap["regime"])
+            b2.metric("XAU/USD (Gold) Bias", bias_badge(snap["xauusd_bias"]))
+            b3.metric("EUR/USD Bias", bias_badge(snap["eurusd_bias"]))
+
+            c_left, c_right = st.columns(2)
+            with c_left:
+                st.info(f"**💵 DXY & Real Yields Context:**\n\n{snap['dxy_yield_context']}")
+            with c_right:
+                st.info(f"**🏦 Fed & ECB Policy Tone:**\n\n{snap['central_bank_summary']}")
+
+            st.warning(f"**🎯 Intraday Execution Guideline:** {snap['trading_guideline']}")
+
+            if snap.get("sources"):
+                with st.expander("Verified Grounding Sources"):
+                    for src in snap["sources"]:
+                        st.markdown(f"- [{src['title']}]({src['uri']})")
+
+        st.divider()
+        cal_col, form_col = st.columns([1.6, 1.0], gap="large")
+
+        with cal_col:
+            st.subheader("Upcoming High-Impact Economic Calendar (UTC)")
+            if not events:
+                st.caption("No upcoming events cached. Run a grounded scan or add a manual catalyst on the right.")
+            else:
+                ev_df = pd.DataFrame(events)
+                ev_cols = ["id", "scheduled_utc", "currency", "impact", "event_name", "forecast", "previous", "actual"]
+                st.dataframe(
+                    ev_df[ev_cols],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "id": "ID",
+                        "scheduled_utc": "Time (UTC)",
+                        "currency": "CCY",
+                        "impact": "Impact",
+                        "event_name": "Release / Catalyst",
+                    },
+                )
+
+                del_col1, del_col2 = st.columns([1, 2])
+                del_id = del_col1.number_input("Event ID to Remove", min_value=1, step=1, label_visibility="collapsed")
+                if del_col2.button("🗑️ Delete Event ID"):
+                    _, d_err = api_delete(f"/macro/events/{int(del_id)}")
+                    if d_err:
+                        st.error(d_err)
+                    else:
+                        st.rerun()
+
+        with form_col:
+            st.subheader("Pin Manual Catalyst (UTC)")
+            st.caption("Ensure exact +/-30m blackout enforcement around NFP, CPI, or FOMC.")
+            with st.form("manual_macro_event_form", clear_on_submit=True):
+                ev_name = st.text_input("Event Name", placeholder="E.g., US Non-Farm Payrolls (NFP)")
+                ev_ccy = st.selectbox("Currency", ["USD", "EUR", "GBP", "JPY"])
+                ev_impact = st.selectbox("Impact", ["HIGH", "MEDIUM"])
+                default_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT13:30:00Z")
+                ev_time = st.text_input("Scheduled UTC (ISO-8601)", value=default_ts)
+                ev_fcst = st.text_input("Forecast (Optional)", placeholder="E.g., 180K or 0.3%")
+                ev_prev = st.text_input("Previous (Optional)", placeholder="E.g., 223K or 0.2%")
+                add_btn = st.form_submit_button("Pin Event to Calendar", type="primary", width="stretch")
+
+                if add_btn:
+                    if not ev_name.strip():
+                        st.warning("Enter an event name.")
+                    else:
+                        aff = ["XAUUSD", "EURUSD"] if ev_ccy == "USD" else ["EURUSD"]
+                        payload = {
+                            "event_name": ev_name.strip(),
+                            "currency": ev_ccy,
+                            "impact": ev_impact,
+                            "scheduled_utc": ev_time.strip(),
+                            "forecast": ev_fcst.strip() or None,
+                            "previous": ev_prev.strip() or None,
+                            "affected_symbols": aff,
+                        }
+                        _, p_err = api_post("/macro/events", json_body=payload)
+                        if p_err:
+                            st.error(p_err)
+                        else:
+                            st.success("Event pinned!")
+                            st.rerun()
+
+# ==============================================================================
+# TAB 2: PHASE 1 & 1.5 TRADE LOG & INTERACTIVE DEBRIEF
+# ==============================================================================
 trades_data, trades_err = api_get("/trades", params={"limit": 200, "symbol": symbol_filter})
 trades_data = trades_data or []
 
@@ -255,6 +413,9 @@ with tab_journal:
                                     st.toast("Debrief complete — JournalEntry saved!", icon="✅")
                                 st.rerun()
 
+# ==============================================================================
+# TAB 3: PHASE 1.5 CHAT WITH JOURNAL
+# ==============================================================================
 with tab_chat:
     st.subheader("Interrogate Your Trading Journal (`gemini-4-hydrogen` + SQLite Tools)")
     st.caption("Ask questions about your win rates, emotional leaks, XAU/USD vs. EUR/USD edge, or The5ers drawdown buffer.")
@@ -300,6 +461,9 @@ with tab_chat:
                 st.session_state.journal_chat_messages.append({"role": "model", "content": res["reply"]})
         st.rerun()
 
+# ==============================================================================
+# TAB 4: EDGE & SESSION ANALYTICS
+# ==============================================================================
 with tab_analytics:
     metrics, m_err = api_get("/analytics/metrics", params={"lookback_days": lookback_days})
     if m_err or not metrics or metrics.get("total_trades") == 0:
@@ -355,6 +519,9 @@ with tab_analytics:
             st.subheader("Top Execution Mistakes")
             st.bar_chart(pd.Series(metrics["top_mistakes"], name="Count"))
 
+# ==============================================================================
+# TAB 5: BEHAVIORAL LEAK AUDIT
+# ==============================================================================
 with tab_audit:
     st.subheader("AI Edge & Behavioral Leak Diagnosis")
     st.write("Uses `gemini-4-hydrogen` (`thinking_level='high'`) to cross-examine your win rates, emotional leaks, and The5ers risk rules.")

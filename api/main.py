@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query
@@ -7,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload
 
 from core.database import init_db, get_db, load_risk_rules
-from core.models import Trade, DailyAccountSnapshot
+from core.models import Trade, DailyAccountSnapshot, MacroEvent, MacroRegimeSnapshot
 from core.schemas import (
     DrawdownStatus,
     ParsedJournalNote,
@@ -15,9 +16,12 @@ from core.schemas import (
     ChatMessage,
     DebriefTurnResponse,
     JournalChatRequest,
+    EconomicCatalyst,
+    NewsBlackoutStatus,
 )
 from connectors.mt5_sync import MT5SyncConnector
 from agents.journal_agent import TradingJournalAgent
+from agents.macro_agent import MacroCatalystAgent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("api")
@@ -26,13 +30,13 @@ logger = logging.getLogger("api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    logger.info("Database initialized and FastAPI backend ready.")
+    logger.info("Database initialized (Phase 1 + Phase 2 tables ready) and FastAPI backend started.")
     yield
 
 
 app = FastAPI(
     title="The5ers Multi-Agent Trading Co-Pilot API",
-    version="1.5.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -62,7 +66,12 @@ class AuditResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "phase": "Phase 1.5 - Interactive Journal & Telemetry"}
+    return {"status": "ok", "phase": "Phase 2 - Interactive Journal & Macro Catalyst Monitor"}
+
+
+# ==============================================================================
+# PHASE 1 & 1.5: MT5 TELEMETRY, INTERACTIVE JOURNAL & ANALYTICS
+# ==============================================================================
 
 
 @app.post("/sync/mt5", response_model=SyncResponse)
@@ -244,3 +253,104 @@ def run_behavioral_audit(lookback_days: int = Query(default=30, ge=1, le=365), d
     except Exception as exc:
         logger.exception("Failed to run behavioral leak audit")
         raise HTTPException(status_code=500, detail=f"Audit error: {exc}")
+
+
+# ==============================================================================
+# PHASE 2: MACRO & ECONOMIC CALENDAR AGENT
+# ==============================================================================
+
+
+@app.post("/macro/refresh")
+def refresh_macro_intelligence(db: Session = Depends(get_db)):
+    """Trigger live Google Search grounded macro scan via gemini-4-hydrogen and store snapshot + events."""
+    try:
+        agent = MacroCatalystAgent()
+        return agent.refresh_macro_brief(db)
+    except Exception as exc:
+        logger.exception("Macro refresh failed")
+        raise HTTPException(status_code=500, detail=f"Macro agent error: {exc}")
+
+
+@app.get("/macro/latest")
+def get_latest_macro_state(db: Session = Depends(get_db)):
+    """Return latest saved MacroRegimeSnapshot and upcoming high-impact economic calendar events."""
+    snapshot = (
+        db.query(MacroRegimeSnapshot)
+        .order_by(MacroRegimeSnapshot.created_at.desc())
+        .first()
+    )
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+    events = (
+        db.query(MacroEvent)
+        .filter(MacroEvent.scheduled_utc >= cutoff)
+        .order_by(MacroEvent.scheduled_utc.asc())
+        .limit(30)
+        .all()
+    )
+
+    return {
+        "snapshot": {
+            "regime": snapshot.regime,
+            "xauusd_bias": snapshot.xauusd_bias,
+            "eurusd_bias": snapshot.eurusd_bias,
+            "dxy_yield_context": snapshot.dxy_yield_context,
+            "central_bank_summary": snapshot.central_bank_summary,
+            "trading_guideline": snapshot.trading_guideline,
+            "sources": snapshot.sources or [],
+            "updated_at": snapshot.created_at.isoformat(),
+        }
+        if snapshot
+        else None,
+        "events": [
+            {
+                "id": e.id,
+                "event_name": e.event_name,
+                "currency": e.currency,
+                "impact": e.impact,
+                "scheduled_utc": e.scheduled_utc.isoformat(),
+                "forecast": e.forecast,
+                "previous": e.previous,
+                "actual": e.actual,
+                "affected_symbols": e.affected_symbols or [],
+            }
+            for e in events
+        ],
+    }
+
+
+@app.get("/macro/blackout", response_model=NewsBlackoutStatus)
+def get_news_blackout_status(symbol: Optional[str] = Query(default="ALL"), db: Session = Depends(get_db)):
+    """Check whether a high-impact news release is active within the +/-30m blackout buffer."""
+    agent = MacroCatalystAgent()
+    return agent.check_news_blackout(db, symbol=symbol)
+
+
+@app.post("/macro/events")
+def create_manual_macro_event(catalyst: EconomicCatalyst, db: Session = Depends(get_db)):
+    """Manually pin a high-impact release (e.g., NFP, CPI, FOMC) into SQLite."""
+    try:
+        agent = MacroCatalystAgent()
+        ev = agent.add_manual_event(db, catalyst)
+        return {
+            "id": ev.id,
+            "event_name": ev.event_name,
+            "currency": ev.currency,
+            "scheduled_utc": ev.scheduled_utc.isoformat(),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Failed to create manual macro event")
+        raise HTTPException(status_code=500, detail=f"Manual event error: {exc}")
+
+
+@app.delete("/macro/events/{event_id}")
+def delete_macro_event(event_id: int, db: Session = Depends(get_db)):
+    """Remove an outdated or incorrect macro calendar event."""
+    ev = db.query(MacroEvent).filter(MacroEvent.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail=f"MacroEvent id={event_id} not found.")
+    db.delete(ev)
+    db.commit()
+    return {"deleted_id": event_id}

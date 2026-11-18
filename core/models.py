@@ -93,3 +93,34 @@ class DailyAccountSnapshot(Base):
     static_drawdown_used_pct: Mapped[float] = mapped_column(Float, default=0.0)
     is_locked_out: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class MacroEvent(Base):
+    """Stores high-impact USD/EUR economic calendar releases tracked by Phase 2 Macro Agent."""
+    __tablename__ = "macro_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), index=True, nullable=False)  # "USD", "EUR", "GBP", "JPY"
+    impact: Mapped[str] = mapped_column(String(15), default="HIGH")  # "HIGH", "MEDIUM"
+    scheduled_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    forecast: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    previous: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    actual: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    affected_symbols: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MacroRegimeSnapshot(Base):
+    """Stores periodic macro regime classifications and directional biases for XAUUSD & EURUSD."""
+    __tablename__ = "macro_regime_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    regime: Mapped[str] = mapped_column(String(30), nullable=False)  # RISK_ON, RISK_OFF, RATE_DRIVEN, EVENT_VOLATILITY
+    xauusd_bias: Mapped[str] = mapped_column(String(20), nullable=False)  # BULLISH, BEARISH, NEUTRAL, VOLATILE_CHOP
+    eurusd_bias: Mapped[str] = mapped_column(String(20), nullable=False)
+    dxy_yield_context: Mapped[str] = mapped_column(Text, nullable=False)
+    central_bank_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    trading_guideline: Mapped[str] = mapped_column(Text, nullable=False)
+    sources: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

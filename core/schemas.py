@@ -64,6 +64,8 @@ class TradeJournalSummary(BaseModel):
     followed_plan: Optional[bool] = None
     mistake_tags: list[str] = Field(default_factory=list)
     ai_feedback: Optional[str] = None
+
+
 class ChatMessage(BaseModel):
     """Single turn in a debrief or journal-chat conversation."""
     role: Literal["user", "model"]
@@ -88,4 +90,35 @@ class JournalChatRequest(BaseModel):
     """Payload for natural-language Q&A against the trader's SQLite journal."""
     messages: list[ChatMessage]
     lookback_days: int = Field(default=60, ge=1, le=365)
-    
+
+
+class EconomicCatalyst(BaseModel):
+    """Single high-impact economic release or central bank speech."""
+    event_name: str = Field(description="Official release name, e.g., 'US Core CPI m/m', 'FOMC Rate Decision', 'US NFP'.")
+    currency: Literal["USD", "EUR", "GBP", "JPY"]
+    impact: Literal["HIGH", "MEDIUM"] = "HIGH"
+    scheduled_utc: str = Field(description="ISO-8601 UTC timestamp, e.g., '2026-11-19T13:30:00Z'.")
+    forecast: Optional[str] = None
+    previous: Optional[str] = None
+    actual: Optional[str] = None
+    affected_symbols: list[str] = Field(default_factory=lambda: ["XAUUSD", "EURUSD"])
+
+
+class MacroRegimeReport(BaseModel):
+    """Structured output produced by Phase 2 Macro Agent."""
+    regime: Literal["RISK_ON", "RISK_OFF", "RATE_DRIVEN", "EVENT_VOLATILITY"]
+    xauusd_bias: Literal["BULLISH", "BEARISH", "NEUTRAL", "VOLATILE_CHOP"]
+    eurusd_bias: Literal["BULLISH", "BEARISH", "NEUTRAL", "VOLATILE_CHOP"]
+    dxy_yield_context: str = Field(description="2-sentence summary of DXY, US 10Y yields, and real rates driving Gold & EUR.")
+    central_bank_summary: str = Field(description="2-sentence summary of current Fed & ECB rate-path expectations.")
+    trading_guideline: str = Field(description="Actionable risk/execution guidance for intraday FX & Gold setups today.")
+    upcoming_catalysts: list[EconomicCatalyst] = Field(default_factory=list)
+
+
+class NewsBlackoutStatus(BaseModel):
+    """Real-time news blackout gatekeeper check against config/risk_rules.yaml buffer."""
+    is_blackout_active: bool
+    buffer_minutes: int
+    active_or_imminent_event: Optional[str] = None
+    minutes_to_event: Optional[int] = None
+    message: str
