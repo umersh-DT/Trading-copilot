@@ -22,7 +22,7 @@ class Base(DeclarativeBase):
 
 
 class Trade(Base):
-    """Stores raw execution telemetry synced from MetaTrader 5."""
+    """Stores live OPEN and historical CLOSED execution telemetry synced from MetaTrader 5."""
     __tablename__ = "trades"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -47,7 +47,7 @@ class Trade(Base):
     # Computed metrics
     risk_amount_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     r_multiple: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    status: Mapped[str] = mapped_column(String(15), default="OPEN")  # "OPEN" or "CLOSED"
+    status: Mapped[str] = mapped_column(String(15), index=True, default="OPEN")  # "OPEN" or "CLOSED"
 
     journal_entry: Mapped[Optional["JournalEntry"]] = relationship(
         back_populates="trade", uselist=False, cascade="all, delete-orphan"
@@ -55,13 +55,26 @@ class Trade(Base):
 
 
 class JournalEntry(Base):
-    """Stores Gemini-parsed setup tags, psychological notes, and discipline grading."""
+    """
+    Two-Stage Execution Journal:
+    - Stage 1 (In-Flight Entry Capture): Recorded while position is OPEN on MT5.
+    - Stage 2 (Post-Close Verdict): Process-over-outcome grading (GOOD_TRADE vs BAD_TRADE) on close.
+    """
     __tablename__ = "journal_entries"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_id: Mapped[int] = mapped_column(ForeignKey("trades.id"), unique=True, nullable=False)
 
-    session: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # ASIA, LONDON, NY, OVERLAP
+    # Stage 1: In-Flight Entry Questionnaire fields
+    entry_thesis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    invalidation_plan: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pre_trade_emotion: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    macro_aligned: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    entry_chart_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stage1_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Stage 2: Post-Close Structured Classification & Process Verdict
+    session: Mapped[Optional[str]] = mapped_column(String(25), nullable=True)  # ASIA, LONDON, NEW_YORK, LONDON_NY_OVERLAP
     setup_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     timeframe: Mapped[Optional[str]] = mapped_column(String(15), nullable=True)
 
@@ -69,6 +82,9 @@ class JournalEntry(Base):
     emotional_state: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     followed_plan: Mapped[bool] = mapped_column(Boolean, default=True)
     mistake_tags: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+
+    process_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # "GOOD_TRADE" or "BAD_TRADE"
+    outcome_quadrant: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # e.g., "GOOD_PROCESS_BAD_OUTCOME"
     ai_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -101,8 +117,8 @@ class MacroEvent(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     event_name: Mapped[str] = mapped_column(String(150), nullable=False)
-    currency: Mapped[str] = mapped_column(String(10), index=True, nullable=False)  # "USD", "EUR", "GBP", "JPY"
-    impact: Mapped[str] = mapped_column(String(15), default="HIGH")  # "HIGH", "MEDIUM"
+    currency: Mapped[str] = mapped_column(String(10), index=True, nullable=False)
+    impact: Mapped[str] = mapped_column(String(15), default="HIGH")
     scheduled_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     forecast: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     previous: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -116,11 +132,32 @@ class MacroRegimeSnapshot(Base):
     __tablename__ = "macro_regime_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    regime: Mapped[str] = mapped_column(String(30), nullable=False)  # RISK_ON, RISK_OFF, RATE_DRIVEN, EVENT_VOLATILITY
-    xauusd_bias: Mapped[str] = mapped_column(String(20), nullable=False)  # BULLISH, BEARISH, NEUTRAL, VOLATILE_CHOP
+    regime: Mapped[str] = mapped_column(String(30), nullable=False)
+    xauusd_bias: Mapped[str] = mapped_column(String(20), nullable=False)
     eurusd_bias: Mapped[str] = mapped_column(String(20), nullable=False)
     dxy_yield_context: Mapped[str] = mapped_column(Text, nullable=False)
     central_bank_summary: Mapped[str] = mapped_column(Text, nullable=False)
     trading_guideline: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DisciplineAuditLog(Base):
+    """Stores Phase 3 Multimodal TradingView Chart & Pre-Trade Discipline Gatekeeper audits."""
+    __tablename__ = "discipline_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
+    proposed_direction: Mapped[str] = mapped_column(String(10), nullable=False)  # "BUY" or "SELL"
+    timeframe: Mapped[str] = mapped_column(String(15), default="M15")
+    proposed_risk_pct: Mapped[float] = mapped_column(Float, default=0.5)
+    setup_description: Mapped[str] = mapped_column(Text, nullable=False)
+    chart_image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    verdict: Mapped[str] = mapped_column(String(15), nullable=False)  # "PASS", "CAUTION", "BLOCK"
+    discipline_score: Mapped[int] = mapped_column(Integer, default=50)  # 0-100
+    chart_structure_read: Mapped[str] = mapped_column(Text, nullable=False)
+    rule_violations: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    coaching_verdict: Mapped[str] = mapped_column(Text, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

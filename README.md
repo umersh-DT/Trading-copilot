@@ -1,19 +1,19 @@
 # The5ers Multi-Agent Trading Co-Pilot
 
-A modular, multi-agent trading assistant built with **Google Gemini (`google-genai`)**, **MetaTrader 5**, **FastAPI**, and **Streamlit**. Engineered specifically around **The5ers High Stakes** prop firm risk guardrails for trading **XAU/USD**, **EUR/USD**, **GBP/USD**, and **USD/JPY**, with full **UTC & UAE (UTC+4)** time localization.
+A modular, multi-agent trading assistant built with **Google Gemini (`google-genai`)**, **MetaTrader 5**, **FastAPI**, and **Streamlit**. Engineered around **The5ers High Stakes** prop firm risk guardrails for trading **XAU/USD**, **EUR/USD**, **GBP/USD**, and **USD/JPY**, featuring full **UTC & UAE (UTC+4)** time localization, resilient multi-model fallback chains, and multimodal TradingView chart vision.
 
 ---
 
-## Architecture & Phased Roadmap
+## Architecture & Completed Roadmap
 
-The system separates execution logging, interactive coaching, macro catalyst tracking, and pre/post-trade rule enforcement into specialized agents sharing a local SQLite database:
+The system separates execution telemetry, interactive coaching, macro catalyst monitoring, and pre/post-trade rule enforcement into specialized agents sharing a local SQLite database:
 
-| Phase | Agent / Module | Gemini Model Chain | Core Responsibilities | Status |
+| Phase | Agent / Module | Resilient Gemini Model Chain | Core Responsibilities | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **Phase 1** | **MT5 Telemetry & Core Journal** (`connectors/mt5_sync.py`, `core/`) | `gemini-4-hydrogen` | Syncs MT5 closed deals, reconstructs R-multiples, calculates live daily/static drawdown buffers, and parses post-trade notes. | **Complete** |
-| **Phase 1.5** | **Interactive Debrief & Journal Chat** (`agents/journal_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Multi-turn post-trade coaching interview, fast single-pass Q&A over SQLite trade history, and deep behavioral leak audits. | **Complete** |
-| **Phase 2** | **Macro & News Radar** (`agents/macro_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Fetches weekly USD/EUR/GBP/JPY economic calendar events, classifies plain-English market regimes & biases for XAU/USD + EUR/USD, and enforces +/-30m news blackouts. | **Complete** |
-| **Phase 3** | **Two-Stage Execution Journal & Discipline Gatekeeper** (`agents/discipline_agent.py`) | `gemini-4-argon` *(Multimodal Vision)* | Auto-detects live MT5 open positions for an instant entry-thesis questionnaire, audits TradingView chart screenshots, and delivers a **Good Trade vs. Bad Trade** process verdict upon close. | **Next** |
+| **Phase 1** | **MT5 Telemetry & Core Journal** (`connectors/mt5_sync.py`, `core/`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Syncs MT5 live open positions and historical closed deals, computes R-multiples, and tracks live daily/static drawdown buffers. | **Complete** |
+| **Phase 1.5** | **Interactive Debrief & Journal Chat** (`agents/journal_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Multi-turn post-trade coaching interviews, fast single-pass natural-language Q&A over SQLite trade history, and deep behavioral leak audits. | **Complete** |
+| **Phase 2** | **Macro & News Radar** (`agents/macro_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Fetches weekly USD/EUR/GBP/JPY economic calendar events, classifies plain-English regimes & biases for XAU/USD + EUR/USD, and enforces +/-30m red-folder news blackouts. | **Complete** |
+| **Phase 3** | **Two-Stage Execution Journal & Discipline Gatekeeper** (`agents/discipline_agent.py`) | `gemini-4-argon` *(Vision)* → `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Polls live MT5 open trades every 15s for an instant **Entry Thesis Questionnaire**, audits TradingView chart screenshots (`PASS` / `CAUTION` / `BLOCK`), and grades closed trades as **GOOD TRADE** vs. **BAD TRADE** regardless of P&L. | **Complete** |
 
 ---
 
@@ -38,21 +38,20 @@ D:\Trading Agent\
 │   └── risk_rules.yaml          # The5ers High Stakes limits, sizing & session windows
 ├── core/
 │   ├── database.py              # SQLite (WAL mode) engine & YAML rule loader
-│   ├── models.py                # SQLAlchemy 2.0 ORM tables (Trades, Journal, Drawdown, Macro)
+│   ├── models.py                # SQLAlchemy 2.0 ORM tables (Trades, Two-Stage Journal, Drawdown, Macro, Audits)
 │   └── schemas.py               # Pydantic schemas for Structured Outputs & REST API
 ├── connectors/
-│   ├── mt5_sync.py              # MetaTrader 5 deal reconstruction & drawdown calculator
-│   └── tv_webhook.py            # TradingView webhook listener (Phase 3)
+│   └── mt5_sync.py              # MetaTrader 5 live open + closed position sync & drawdown calculator
 ├── agents/
-│   ├── journal_agent.py         # Phase 1 & 1.5: Interactive debrief, journal chat & leak audit
+│   ├── journal_agent.py         # Phase 1 & 1.5: Interactive debrief, fast journal chat & leak audit
 │   ├── macro_agent.py           # Phase 2: Economic calendar, plain-English bias & news blackout
-│   └── discipline_agent.py      # Phase 3: Multimodal chart TA & Good/Bad trade gatekeeper
+│   └── discipline_agent.py      # Phase 3: Multimodal chart TA & Good/Bad trade process gatekeeper
 ├── api/
 │   └── main.py                  # FastAPI REST backend (port 8000)
 ├── ui/
-│   └── app.py                   # Streamlit 5-tab dashboard with UTC + UAE (UTC+4) clocks (port 8501)
-├── start.ps1                    # 1-click PowerShell launcher with auto port cleanup
-├── data/                        # Local SQLite database (git-ignored)
+│   └── app.py                   # Streamlit 6-tab control center with 15s live polling & UTC/UAE clocks (port 8501)
+├── start.ps1                    # 1-click PowerShell launcher with automatic port 8000/8501 cleanup
+├── data/                        # Local SQLite database & uploaded chart screenshots (git-ignored)
 ├── logs/                        # Background FastAPI logs (git-ignored)
 ├── .env.example                 # Environment variable template
 └── requirements.txt             # Python dependencies

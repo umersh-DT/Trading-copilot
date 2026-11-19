@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import requests
 import pandas as pd
 import plotly.express as px
@@ -7,12 +7,29 @@ import plotly.graph_objects as go
 import streamlit as st
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+UAE_TZ = timezone(timedelta(hours=4))
 
 st.set_page_config(
-    page_title="The5ers Trading Co-Pilot | Phase 2",
-    page_icon="📈",
+    page_title="The5ers Trading Co-Pilot | Phase 3",
+    page_icon="🛡️",
     layout="wide",
 )
+
+
+def fmt_utc_uae(iso_str: str | None) -> str:
+    """Convert any ISO timestamp string into 'YYYY-MM-DD HH:MM UTC (HH:MM UAE)'."""
+    if not iso_str:
+        return "N/A"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        uae_dt = dt.astimezone(UAE_TZ)
+        return f"{dt.strftime('%Y-%m-%d %H:%M')} UTC ({uae_dt.strftime('%H:%M')} UAE)"
+    except Exception:
+        return iso_str
 
 
 def api_get(path: str, params: dict | None = None):
@@ -36,6 +53,18 @@ def api_post(path: str, json_body: dict | None = None, params: dict | None = Non
         return None, str(e)
 
 
+def api_upload_image(uploaded_file) -> tuple[str | None, str | None]:
+    if uploaded_file is None:
+        return None, None
+    try:
+        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "image/png")}
+        resp = requests.post(f"{API_BASE_URL}/charts/upload", files=files, timeout=30)
+        resp.raise_for_status()
+        return resp.json().get("chart_image_path"), None
+    except Exception as e:
+        return None, str(e)
+
+
 def api_delete(path: str):
     try:
         resp = requests.delete(f"{API_BASE_URL}{path}", timeout=30)
@@ -46,11 +75,11 @@ def api_delete(path: str):
 
 
 def render_drawdown_gauge(title: str, used_pct: float, soft_limit: float, hard_limit: float, remaining_usd: float):
-    bar_color = "#22c55e"  # Green
+    bar_color = "#22c55e"
     if used_pct >= soft_limit:
-        bar_color = "#ef4444"  # Red
+        bar_color = "#ef4444"
     elif used_pct >= (soft_limit * 0.65):
-        bar_color = "#f59e0b"  # Amber
+        bar_color = "#f59e0b"
 
     fig = go.Figure(
         go.Indicator(
@@ -79,32 +108,46 @@ def render_drawdown_gauge(title: str, used_pct: float, soft_limit: float, hard_l
 
 def bias_badge(bias: str) -> str:
     mapping = {
-        "BULLISH": "🟢 BULLISH",
-        "BEARISH": "🔴 BEARISH",
-        "NEUTRAL": "⚪ NEUTRAL",
-        "VOLATILE_CHOP": "🟠 VOLATILE CHOP",
+        "BULLISH": "🟢 Uptrend (Buyers)",
+        "BEARISH": "🔴 Downtrend (Sellers)",
+        "NEUTRAL": "⚪ Sideways / Balanced",
+        "VOLATILE_CHOP": "🟠 Messy / Up-Down Spikes",
     }
     return mapping.get(bias, bias)
 
 
+def regime_badge(regime: str) -> str:
+    mapping = {
+        "EVENT_VOLATILITY": "⚡ Major News Ahead",
+        "RATE_DRIVEN": "🏦 Interest-Rate Driven",
+        "RISK_ON": "📈 Confident / Risk-On",
+        "RISK_OFF": "🛡️ Cautious / Safe-Haven",
+    }
+    return mapping.get(regime, regime)
+
+
 # --- Sidebar Controls ---
 with st.sidebar:
-    st.title("⚡ Co-Pilot Controls")
-    st.caption("Phase 2: Interactive Journal & Macro Radar")
+    st.title("🛡️ Co-Pilot Controls")
+    st.caption("Phase 3: Two-Stage Journal & Multimodal Gatekeeper")
 
     lookback_days = st.slider("History Lookback (Days)", min_value=7, max_value=180, value=30, step=1)
+    live_poll_enabled = st.toggle("📡 Auto-Poll MT5 Open Trades (15s)", value=True)
 
     if st.button("🔄 Sync MetaTrader 5 Now", width="stretch", type="primary"):
-        with st.spinner("Connecting to MT5 terminal & syncing closed deals..."):
+        with st.spinner("Syncing open & closed MT5 positions..."):
             sync_data, err = api_post("/sync/mt5", params={"lookback_days": lookback_days})
             if err:
                 st.error(f"Sync failed: {err}")
             else:
-                st.success(f"Synced {sync_data['trades_synced']} trades!")
+                msg = f"Synced {sync_data['trades_synced']} closed | {sync_data['open_positions_count']} live open"
+                if sync_data.get("auto_verdicts_generated", 0) > 0:
+                    msg += f" | {sync_data['auto_verdicts_generated']} Good/Bad Trade verdicts graded!"
+                st.success(msg)
                 st.rerun()
 
     if st.button("🌍 Refresh Macro & Calendar", width="stretch"):
-        with st.spinner("Scanning live DXY, yields, Fed/ECB & red-folder calendar via Google Search..."):
+        with st.spinner("Checking this week's economic calendar & market direction..."):
             macro_res, m_err = api_post("/macro/refresh")
             if m_err:
                 st.error(f"Macro scan failed: {m_err}")
@@ -114,8 +157,15 @@ with st.sidebar:
 
     st.divider()
     symbol_filter = st.selectbox("Filter Instrument", ["ALL", "XAUUSD", "EURUSD", "GBPUSD", "USDJPY"])
-    st.caption(f"Current UTC: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}`")
-    st.info("Active Model: `gemini-4-hydrogen`\nFirm: **The5ers High Stakes**")
+
+    now_utc = datetime.now(timezone.utc)
+    now_uae = now_utc.astimezone(UAE_TZ)
+    st.info(
+        f"**Current Clock:**\n"
+        f"`{now_utc.strftime('%H:%M')} UTC` (`{now_uae.strftime('%H:%M')} UAE`)\n\n"
+        f"Vision Model: `gemini-4-argon`\n"
+        f"Firm: **The5ers High Stakes**"
+    )
 
 
 # --- Header, News Blackout Banner & Live Drawdown Gauges ---
@@ -127,7 +177,7 @@ if dd_err:
     st.stop()
 
 if dd_status["soft_lock_triggered"]:
-    st.error(f"🚨 **DRAWDOWN CIRCUIT BREAKER TRIGGERED:** {dd_status['lock_reason']} Stop trading for the session.")
+    st.error(f"🚨 **DRAWDOWN STOP-LOSS TRIGGERED:** {dd_status['lock_reason']} Stop trading for today.")
 
 blackout_status, _ = api_get("/macro/blackout", params={"symbol": symbol_filter})
 if blackout_status:
@@ -136,6 +186,108 @@ if blackout_status:
     else:
         st.success(f"🟢 **{blackout_status['message']}**")
 
+
+# ==============================================================================
+# LIVE MT5 OPEN-POSITION WATCHER (15-SECOND AUTO-POLLING FRAGMENT)
+# ==============================================================================
+@st.fragment(run_every=15 if live_poll_enabled else None)
+def render_live_open_positions_watcher():
+    open_positions, open_err = api_get("/positions/open", params={"poll_mt5": True})
+    if open_err or not open_positions:
+        return
+
+    st.warning(f"⚡ **LIVE MT5 OPEN POSITIONS DETECTED ({len(open_positions)}) — Complete Your Entry Thesis Before Closing!**")
+
+    for pos in open_positions:
+        pos_id = pos["mt5_position_id"]
+        sl_text = f"{pos['stop_loss']}" if pos.get("stop_loss") else "⚠️ NO STOP LOSS SET"
+        risk_text = f"${pos['risk_amount_usd']:.2f}" if pos.get("risk_amount_usd") else "Unknown"
+
+        with st.container(border=True):
+            h1, h2, h3, h4, h5 = st.columns(5)
+            h1.metric(f"Ticket #{pos_id}", f"{pos['symbol']} {pos['direction']}", f"{pos['volume']} lots")
+            h2.metric("Entry Price", f"{pos['entry_price']}", f"SL: {sl_text}")
+            h3.metric("Live Floating P&L", f"${pos['floating_pnl']:+.2f}", f"Risk: {risk_text}")
+            h4.metric("Opened — UTC (UAE)", fmt_utc_uae(pos["open_time"]))
+            h5.metric("Stage 1 Status", "✅ Thesis Locked" if pos["stage1_completed"] else "⏳ Action Needed")
+
+            if pos["stage1_completed"]:
+                st.success(
+                    f"**Locked Entry Thesis ({pos.get('setup_type')}):** {pos.get('entry_thesis')} | "
+                    f"**Invalidation:** {pos.get('invalidation_plan')} | **Emotion:** `{pos.get('pre_trade_emotion')}`"
+                )
+            else:
+                with st.form(f"stage1_form_{pos_id}"):
+                    st.markdown(f"**📋 Why did you take this `{pos['symbol']} {pos['direction']}` trade right now?**")
+                    c1, c2, c3 = st.columns(3)
+                    setup_type = c1.selectbox(
+                        "Setup Pattern",
+                        [
+                            "15M Impulse Setup",
+                            "London Liquidity Sweep",
+                            "NY Reversal / FVG Retest",
+                            "Order Block Bounce",
+                            "RSI Divergence",
+                            "Breakout / Momentum",
+                            "Impulse / Unplanned",
+                        ],
+                        key=f"s1_setup_{pos_id}",
+                    )
+                    timeframe = c2.selectbox("Timeframe", ["M5", "M15", "M30", "H1", "H4"], index=1, key=f"s1_tf_{pos_id}")
+                    emotion = c3.selectbox(
+                        "Mental State Right Now",
+                        ["CALM", "CONFIDENT", "FOMO", "REVENGE", "HESITANT", "BORED"],
+                        key=f"s1_emo_{pos_id}",
+                    )
+
+                    entry_thesis = st.text_input(
+                        "Why was this trade taken? (Entry Trigger & Confluence)",
+                        placeholder="E.g., Swept Asian session low + 15m bullish engulfing with DXY rejecting resistance.",
+                        key=f"s1_thesis_{pos_id}",
+                    )
+                    invalidation_plan = st.text_input(
+                        "Where is your hard Stop Loss and what proves this trade wrong?",
+                        placeholder="E.g., Hard SL placed below sweep wick at 2612.50 (0.5% risk).",
+                        key=f"s1_inv_{pos_id}",
+                    )
+
+                    u1, u2 = st.columns([1, 2])
+                    macro_aligned = u1.checkbox("Aligned with Macro Radar Bias", value=True, key=f"s1_macro_{pos_id}")
+                    chart_file = u2.file_uploader(
+                        "Optional: Attach Entry TradingView Screenshot (PNG/JPG)",
+                        type=["png", "jpg", "jpeg"],
+                        key=f"s1_chart_{pos_id}",
+                    )
+
+                    submit_s1 = st.form_submit_button("🔒 Lock In Entry Thesis", type="primary", width="stretch")
+                    if submit_s1:
+                        if not entry_thesis.strip() or not invalidation_plan.strip():
+                            st.warning("Fill in both your Entry Thesis and Invalidation Plan before locking.")
+                        else:
+                            chart_path, up_err = api_upload_image(chart_file)
+                            if up_err:
+                                st.error(f"Chart upload failed: {up_err}")
+                            else:
+                                payload = {
+                                    "setup_type": setup_type,
+                                    "timeframe": timeframe,
+                                    "entry_thesis": entry_thesis.strip(),
+                                    "invalidation_plan": invalidation_plan.strip(),
+                                    "pre_trade_emotion": emotion,
+                                    "macro_aligned": macro_aligned,
+                                    "entry_chart_path": chart_path,
+                                }
+                                _, s1_err = api_post(f"/trades/{pos_id}/stage1", json_body=payload)
+                                if s1_err:
+                                    st.error(s1_err)
+                                else:
+                                    st.toast(f"Stage 1 Thesis locked for #{pos_id}!", icon="🔒")
+                                    st.rerun()
+
+
+render_live_open_positions_watcher()
+
+# --- Drawdown Metrics & Gauges ---
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 col_m1.metric("Current Equity", f"${dd_status['current_equity']:,.2f}", f"Ref: ${dd_status['day_reference_level']:,.2f}")
 col_m2.metric("Starting Balance", f"${dd_status['starting_account_balance']:,.2f}", f"Date: {dd_status['trading_date']}")
@@ -146,7 +298,7 @@ g1, g2 = st.columns(2)
 with g1:
     st.plotly_chart(
         render_drawdown_gauge(
-            "Daily Loss Limit (5.0% Max / 3.5% Soft Lock)",
+            "Daily Loss Limit (5.0% Max / 3.5% Soft Stop)",
             dd_status["daily_drawdown_used_pct"],
             soft_limit=3.5,
             hard_limit=5.0,
@@ -157,7 +309,7 @@ with g1:
 with g2:
     st.plotly_chart(
         render_drawdown_gauge(
-            "Max Static Drawdown (10.0% Max / 7.5% Soft Lock)",
+            "Max Static Drawdown (10.0% Max / 7.5% Soft Stop)",
             dd_status["static_drawdown_used_pct"],
             soft_limit=7.5,
             hard_limit=10.0,
@@ -168,11 +320,12 @@ with g2:
 
 st.divider()
 
-# --- Main Tabs (Phase 1 + Phase 1.5 + Phase 2) ---
-tab_macro, tab_journal, tab_chat, tab_analytics, tab_audit = st.tabs(
+# --- Main 6 Tabs (Phases 1, 1.5, 2, & 3) ---
+tab_gatekeeper, tab_journal, tab_macro, tab_chat, tab_analytics, tab_audit = st.tabs(
     [
+        "🛡️ Chart & Discipline Gatekeeper",
+        "📓 Two-Stage Trade Log & Verdicts",
         "🌍 Macro & News Radar",
-        "📓 Trade Log & AI Debrief",
         "💬 Chat With Journal",
         "📊 Edge & Session Analytics",
         "🧠 Behavioral Leak Audit",
@@ -180,143 +333,130 @@ tab_macro, tab_journal, tab_chat, tab_analytics, tab_audit = st.tabs(
 )
 
 # ==============================================================================
-# TAB 1: PHASE 2 MACRO & NEWS RADAR
+# TAB 1: PHASE 3 MULTIMODAL CHART & DISCIPLINE GATEKEEPER (gemini-4-argon)
 # ==============================================================================
-with tab_macro:
-    macro_data, macro_err = api_get("/macro/latest")
-    if macro_err:
-        st.error(f"Could not load macro state: {macro_err}")
-    else:
-        snap = macro_data.get("snapshot")
-        events = macro_data.get("events", [])
+with tab_gatekeeper:
+    st.subheader("Pre-Trade Chart & Rule Check (`gemini-4-argon` Multimodal Vision)")
+    st.caption(
+        "Upload your TradingView chart screenshot BEFORE clicking Buy/Sell on MT5. "
+        "The Gatekeeper audits chart structure, The5ers drawdown headroom, +/-30m news blackouts, Macro Radar bias, and your 60-day edge."
+    )
 
-        top_m1, top_m2 = st.columns([3, 1])
-        with top_m1:
-            st.subheader("Live Macro Regime & Central Bank Bias")
-            if snap:
-                st.caption(f"Last Grounded Scan: `{snap['updated_at']}`")
-            else:
-                st.info("No macro scan saved yet. Click **🌍 Refresh Macro & Calendar** to run a live grounded search.")
-        with top_m2:
-            if st.button("🔄 Run Grounded Scan Now", type="primary", width="stretch"):
-                with st.spinner("Searching DXY, 10Y yields, Fed/ECB & economic calendar..."):
-                    res, err = api_post("/macro/refresh")
-                    if err:
-                        st.error(err)
-                    else:
-                        st.rerun()
+    gk_left, gk_right = st.columns([1.1, 1.2], gap="large")
 
-        if snap:
-            b1, b2, b3 = st.columns(3)
-            b1.metric("Macro Regime", snap["regime"])
-            b2.metric("XAU/USD (Gold) Bias", bias_badge(snap["xauusd_bias"]))
-            b3.metric("EUR/USD Bias", bias_badge(snap["eurusd_bias"]))
+    with gk_left:
+        with st.form("pre_trade_gatekeeper_form"):
+            r1_c1, r1_c2, r1_c3 = st.columns(3)
+            gk_symbol = r1_c1.selectbox("Instrument", ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"])
+            gk_dir = r1_c2.selectbox("Direction", ["BUY", "SELL"])
+            gk_tf = r1_c3.selectbox("Timeframe", ["M5", "M15", "M30", "H1", "H4"], index=1)
 
-            c_left, c_right = st.columns(2)
-            with c_left:
-                st.info(f"**💵 DXY & Real Yields Context:**\n\n{snap['dxy_yield_context']}")
-            with c_right:
-                st.info(f"**🏦 Fed & ECB Policy Tone:**\n\n{snap['central_bank_summary']}")
+            gk_risk = st.slider(
+                "Planned Risk Per Trade (% of Account — Max 1.0%)",
+                min_value=0.1,
+                max_value=2.0,
+                value=0.5,
+                step=0.1,
+            )
+            gk_desc = st.text_area(
+                "Setup Plan, Entry Price & Stop-Loss Placement",
+                placeholder="E.g., XAUUSD BUY on 15m impulse retest after London sweep. Entry 2624.00, Hard SL 2618.00 (0.5% risk), TP 2636.00.",
+                height=100,
+            )
+            gk_chart = st.file_uploader(
+                "Upload TradingView Chart Screenshot (PNG / JPG)",
+                type=["png", "jpg", "jpeg"],
+            )
 
-            st.warning(f"**🎯 Intraday Execution Guideline:** {snap['trading_guideline']}")
+            run_gk = st.form_submit_button("🛡️ Run Pre-Trade Gatekeeper Audit", type="primary", width="stretch")
 
-            if snap.get("sources"):
-                with st.expander("Verified Grounding Sources"):
-                    for src in snap["sources"]:
-                        st.markdown(f"- [{src['title']}]({src['uri']})")
-
-        st.divider()
-        cal_col, form_col = st.columns([1.6, 1.0], gap="large")
-
-        with cal_col:
-            st.subheader("Upcoming High-Impact Economic Calendar (UTC)")
-            if not events:
-                st.caption("No upcoming events cached. Run a grounded scan or add a manual catalyst on the right.")
-            else:
-                ev_df = pd.DataFrame(events)
-                ev_cols = ["id", "scheduled_utc", "currency", "impact", "event_name", "forecast", "previous", "actual"]
-                st.dataframe(
-                    ev_df[ev_cols],
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "id": "ID",
-                        "scheduled_utc": "Time (UTC)",
-                        "currency": "CCY",
-                        "impact": "Impact",
-                        "event_name": "Release / Catalyst",
-                    },
-                )
-
-                del_col1, del_col2 = st.columns([1, 2])
-                del_id = del_col1.number_input("Event ID to Remove", min_value=1, step=1, label_visibility="collapsed")
-                if del_col2.button("🗑️ Delete Event ID"):
-                    _, d_err = api_delete(f"/macro/events/{int(del_id)}")
-                    if d_err:
-                        st.error(d_err)
-                    else:
-                        st.rerun()
-
-        with form_col:
-            st.subheader("Pin Manual Catalyst (UTC)")
-            st.caption("Ensure exact +/-30m blackout enforcement around NFP, CPI, or FOMC.")
-            with st.form("manual_macro_event_form", clear_on_submit=True):
-                ev_name = st.text_input("Event Name", placeholder="E.g., US Non-Farm Payrolls (NFP)")
-                ev_ccy = st.selectbox("Currency", ["USD", "EUR", "GBP", "JPY"])
-                ev_impact = st.selectbox("Impact", ["HIGH", "MEDIUM"])
-                default_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT13:30:00Z")
-                ev_time = st.text_input("Scheduled UTC (ISO-8601)", value=default_ts)
-                ev_fcst = st.text_input("Forecast (Optional)", placeholder="E.g., 180K or 0.3%")
-                ev_prev = st.text_input("Previous (Optional)", placeholder="E.g., 223K or 0.2%")
-                add_btn = st.form_submit_button("Pin Event to Calendar", type="primary", width="stretch")
-
-                if add_btn:
-                    if not ev_name.strip():
-                        st.warning("Enter an event name.")
-                    else:
-                        aff = ["XAUUSD", "EURUSD"] if ev_ccy == "USD" else ["EURUSD"]
-                        payload = {
-                            "event_name": ev_name.strip(),
-                            "currency": ev_ccy,
-                            "impact": ev_impact,
-                            "scheduled_utc": ev_time.strip(),
-                            "forecast": ev_fcst.strip() or None,
-                            "previous": ev_prev.strip() or None,
-                            "affected_symbols": aff,
-                        }
-                        _, p_err = api_post("/macro/events", json_body=payload)
-                        if p_err:
-                            st.error(p_err)
+            if run_gk:
+                if not gk_desc.strip():
+                    st.warning("Describe your entry and stop-loss setup first.")
+                else:
+                    with st.spinner("gemini-4-argon is inspecting your chart, macro regime, news buffer, and risk rules..."):
+                        chart_path, up_err = api_upload_image(gk_chart)
+                        if up_err:
+                            st.error(f"Chart upload failed: {up_err}")
                         else:
-                            st.success("Event pinned!")
-                            st.rerun()
+                            payload = {
+                                "symbol": gk_symbol,
+                                "proposed_direction": gk_dir,
+                                "timeframe": gk_tf,
+                                "proposed_risk_pct": gk_risk,
+                                "setup_description": gk_desc.strip(),
+                                "chart_image_path": chart_path,
+                            }
+                            gk_res, gk_err = api_post("/gatekeeper/audit", json_body=payload)
+                            if gk_err:
+                                st.error(gk_err)
+                            else:
+                                st.session_state["latest_gk_audit"] = gk_res
+
+    with gk_right:
+        st.subheader("Gatekeeper Verdict")
+        latest_gk = st.session_state.get("latest_gk_audit")
+        if latest_gk:
+            rep = latest_gk["report"]
+            verdict = rep["verdict"]
+            score = rep["discipline_score"]
+
+            if verdict == "PASS":
+                st.success(f"### ✅ VERDICT: PASS (Discipline Score: {score}/100)")
+            elif verdict == "CAUTION":
+                st.warning(f"### ⚠️ VERDICT: CAUTION (Discipline Score: {score}/100)")
+            else:
+                st.error(f"### 🛑 VERDICT: BLOCK — DO NOT ENTER (Discipline Score: {score}/100)")
+
+            st.info(f"**📈 TradingView Chart Read:**\n\n{rep['chart_structure_read']}")
+
+            if rep.get("rule_violations"):
+                st.error("**🚨 Rule Conflicts / Warnings:**\n" + "\n".join(f"- {v}" for v in rep["rule_violations"]))
+            else:
+                st.success("**No rule violations or news conflicts detected.**")
+
+            st.markdown(f"**🎯 Coach Action Recommendation:** {rep['coaching_verdict']}")
+        else:
+            st.info("Submit a setup (and optional TradingView screenshot) on the left to get an instant `PASS` / `CAUTION` / `BLOCK` verdict.")
+
+        history_data, _ = api_get("/gatekeeper/history", params={"limit": 5})
+        if history_data:
+            with st.expander("Recent Gatekeeper Checks"):
+                for item in history_data:
+                    st.markdown(
+                        f"- **{item['verdict']}** ({item['discipline_score']}/100) — `{item['symbol']} {item['direction']}` "
+                        f"({item['timeframe']}, {item['risk_pct']}% risk) at `{item['created_at']}`"
+                    )
 
 # ==============================================================================
-# TAB 2: PHASE 1 & 1.5 TRADE LOG & INTERACTIVE DEBRIEF
+# TAB 2: TWO-STAGE TRADE LOG & GOOD/BAD TRADE PROCESS VERDICTS
 # ==============================================================================
 trades_data, trades_err = api_get("/trades", params={"limit": 200, "symbol": symbol_filter})
 trades_data = trades_data or []
 
 with tab_journal:
-    left_col, right_col = st.columns([1.4, 1.0], gap="large")
+    left_col, right_col = st.columns([1.45, 1.0], gap="large")
 
     with left_col:
-        st.subheader("Synced MT5 Closed Trades")
+        st.subheader("Closed Trades — Process Verdict vs. Profit/Loss")
         if not trades_data:
             st.warning("No closed trades found. Click **Sync MetaTrader 5 Now** in the sidebar.")
         else:
             df = pd.DataFrame(trades_data)
+            df["closed_utc_uae"] = df["close_time"].apply(fmt_utc_uae)
+            df["verdict_badge"] = df["process_verdict"].apply(
+                lambda v: "🟢 GOOD TRADE" if v == "GOOD_TRADE" else ("🔴 BAD TRADE" if v == "BAD_TRADE" else "⏳ Pending")
+            )
             display_cols = [
                 "mt5_position_id",
+                "closed_utc_uae",
                 "symbol",
                 "direction",
-                "volume",
                 "net_profit",
                 "r_multiple",
-                "session",
+                "verdict_badge",
                 "setup_type",
-                "emotional_state",
-                "followed_plan",
+                "session",
             ]
             st.dataframe(
                 df[display_cols],
@@ -324,9 +464,10 @@ with tab_journal:
                 hide_index=True,
                 column_config={
                     "mt5_position_id": "MT5 ID",
+                    "closed_utc_uae": "Closed — UTC (UAE)",
                     "net_profit": st.column_config.NumberColumn("Net PnL ($)", format="$%.2f"),
                     "r_multiple": st.column_config.NumberColumn("R-Mult", format="%.2fR"),
-                    "followed_plan": st.column_config.CheckboxColumn("Plan Followed"),
+                    "verdict_badge": "Process Verdict",
                 },
             )
 
@@ -334,42 +475,64 @@ with tab_journal:
             df_sorted["cum_pnl"] = df_sorted["net_profit"].cumsum()
             fig_eq = px.line(
                 df_sorted,
-                x="close_time",
+                x="closed_utc_uae",
                 y="cum_pnl",
                 markers=True,
                 title="Cumulative Realized PnL ($)",
-                labels={"close_time": "Close Time (UTC)", "cum_pnl": "Net Profit ($)"},
+                labels={"closed_utc_uae": "Close Time — UTC (UAE)", "cum_pnl": "Net Profit ($)"},
             )
-            fig_eq.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
+            fig_eq.update_layout(height=270, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig_eq, width="stretch")
 
     with right_col:
-        st.subheader("Interactive Post-Trade Debrief")
+        st.subheader("Process-Over-Outcome Verdict & Debrief")
         if not trades_data:
-            st.info("Sync MT5 trades on the left to start an interactive coaching debrief.")
+            st.info("Sync MT5 trades on the left to inspect Good/Bad Trade verdicts or run a coaching debrief.")
         else:
             trade_options = {
                 f"#{t['mt5_position_id']} | {t['symbol']} {t['direction']} (${t['net_profit']:+.2f})": t
                 for t in trades_data
             }
-            selected_label = st.selectbox("Select Trade to Debrief", list(trade_options.keys()))
+            selected_label = st.selectbox("Select Closed Trade", list(trade_options.keys()))
             selected_trade = trade_options[selected_label]
             pos_id = selected_trade["mt5_position_id"]
 
-            if selected_trade.get("ai_feedback"):
-                st.success(
-                    f"**Saved Journal Tag:** `{selected_trade['setup_type']}` | "
-                    f"Session: `{selected_trade['session']}` | Emotion: `{selected_trade['emotional_state']}`\n\n"
-                    f"{selected_trade['ai_feedback']}"
-                )
+            if selected_trade.get("entry_thesis"):
+                st.info(f"**Stage 1 Entry Thesis:** {selected_trade['entry_thesis']}")
 
+            pv = selected_trade.get("process_verdict")
+            quad = selected_trade.get("outcome_quadrant") or ""
+            if pv == "GOOD_TRADE":
+                st.success(
+                    f"**🟢 GOOD TRADE** (`{quad}`) | Setup: `{selected_trade['setup_type']}` | "
+                    f"Session: `{selected_trade['session']}`\n\n{selected_trade.get('ai_feedback', '')}"
+                )
+            elif pv == "BAD_TRADE":
+                st.error(
+                    f"**🔴 BAD TRADE** (`{quad}`) | Setup: `{selected_trade['setup_type']}` | "
+                    f"Session: `{selected_trade['session']}`\n\n{selected_trade.get('ai_feedback', '')}"
+                )
+            elif selected_trade.get("ai_feedback"):
+                st.success(f"**Saved Feedback:** {selected_trade['ai_feedback']}")
+
+            if st.button("⚖️ Grade Good Trade vs. Bad Trade Now", width="stretch", type="primary"):
+                with st.spinner("Evaluating process discipline regardless of P&L..."):
+                    v_res, v_err = api_post(f"/trades/{pos_id}/verdict")
+                    if v_err:
+                        st.error(v_err)
+                    else:
+                        st.toast(f"Verdict saved: {v_res['process_verdict']}", icon="⚖️")
+                        st.rerun()
+
+            st.divider()
+            st.caption("Optional: Multi-Turn Interactive Coaching Interview")
             debrief_key = f"debrief_history_{pos_id}"
             if debrief_key not in st.session_state:
                 st.session_state[debrief_key] = []
 
             col_b1, col_b2 = st.columns(2)
-            if col_b1.button("🎙️ Start / Reset Debrief", width="stretch"):
-                with st.spinner("Coach is reviewing MT5 execution telemetry..."):
+            if col_b1.button("🎙️ Start / Reset Interview", width="stretch"):
+                with st.spinner("Coach is reviewing MT5 execution details..."):
                     res, err = api_post(f"/trades/{pos_id}/debrief", json_body={"conversation": []})
                     if err:
                         st.error(err)
@@ -388,7 +551,6 @@ with tab_journal:
                             st.error(err)
                         else:
                             st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
-                            st.success("Journal entry saved to SQLite!")
                             st.rerun()
 
                 for msg in st.session_state[debrief_key]:
@@ -397,7 +559,7 @@ with tab_journal:
 
                 with st.form(f"debrief_reply_form_{pos_id}", clear_on_submit=True):
                     trader_reply = st.text_input("Your answer to the coach...")
-                    send_reply = st.form_submit_button("Send Reply", type="primary", width="stretch")
+                    send_reply = st.form_submit_button("Send Reply", width="stretch")
                     if send_reply and trader_reply.strip():
                         st.session_state[debrief_key].append({"role": "user", "content": trader_reply.strip()})
                         with st.spinner("Coach is analyzing your response..."):
@@ -409,30 +571,144 @@ with tab_journal:
                                 st.error(err)
                             else:
                                 st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
-                                if res["status"] == "COMPLETED":
-                                    st.toast("Debrief complete — JournalEntry saved!", icon="✅")
                                 st.rerun()
 
 # ==============================================================================
-# TAB 3: PHASE 1.5 CHAT WITH JOURNAL
+# TAB 3: PHASE 2 MACRO & NEWS RADAR
+# ==============================================================================
+with tab_macro:
+    macro_data, macro_err = api_get("/macro/latest")
+    if macro_err:
+        st.error(f"Could not load macro state: {macro_err}")
+    else:
+        snap = macro_data.get("snapshot")
+        events = macro_data.get("events", [])
+
+        top_m1, top_m2 = st.columns([3, 1])
+        with top_m1:
+            st.subheader("Market Condition & Trade Direction Guide")
+            if snap:
+                st.caption(f"Last Updated: `{fmt_utc_uae(snap['updated_at'])}`")
+            else:
+                st.info("No macro scan saved yet. Click **🌍 Refresh Macro & Calendar** in the sidebar.")
+        with top_m2:
+            if st.button("🔄 Refresh Market Guide", type="primary", width="stretch"):
+                with st.spinner("Checking calendar & analyzing Gold and EUR/USD..."):
+                    res, err = api_post("/macro/refresh")
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+
+        if snap:
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Market Condition", regime_badge(snap["regime"]))
+            b2.metric("XAU/USD (Gold) Bias", bias_badge(snap["xauusd_bias"]))
+            b3.metric("EUR/USD Bias", bias_badge(snap["eurusd_bias"]))
+
+            with st.expander("ℹ️ What do these labels mean?"):
+                st.markdown(
+                    "- **🟢 Uptrend (Buyers):** News favors higher prices—focus on buy setups.\n"
+                    "- **🔴 Downtrend (Sellers):** News favors lower prices—focus on sell setups.\n"
+                    "- **⚪ Sideways / Balanced:** No strong push either way—range highs/lows tend to hold.\n"
+                    "- **🟠 Messy / Up-Down Spikes (Volatile Chop):** Price jumps sharply both ways around big news, hitting stop-losses on both sides. Avoid chasing breakouts."
+                )
+
+            c_left, c_right = st.columns(2)
+            with c_left:
+                st.info(f"**💵 US Dollar & Yields Summary:**\n\n{snap['dxy_yield_context']}")
+            with c_right:
+                st.info(f"**🏦 Fed & ECB Interest-Rate Outlook:**\n\n{snap['central_bank_summary']}")
+
+            st.warning(f"**🎯 Today's Trading Action Plan:** {snap['trading_guideline']}")
+
+        st.divider()
+        cal_col, form_col = st.columns([1.7, 1.0], gap="large")
+
+        with cal_col:
+            st.subheader("Upcoming High-Impact News — UTC (UAE Time)")
+            if not events:
+                st.caption("No upcoming events cached. Click Refresh Market Guide or pin a custom news time on the right.")
+            else:
+                ev_df = pd.DataFrame(events)
+                ev_df["time_utc_uae"] = ev_df["scheduled_utc"].apply(fmt_utc_uae)
+                ev_cols = ["id", "time_utc_uae", "currency", "impact", "event_name", "forecast", "previous", "actual"]
+                st.dataframe(
+                    ev_df[ev_cols],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "id": "ID",
+                        "time_utc_uae": "Time — UTC (UAE UTC+4)",
+                        "currency": "CCY",
+                        "impact": "Impact",
+                        "event_name": "News Release",
+                    },
+                )
+
+                del_col1, del_col2 = st.columns([1, 2])
+                del_id = del_col1.number_input("Event ID to Remove", min_value=1, step=1, label_visibility="collapsed")
+                if del_col2.button("🗑️ Delete Event ID"):
+                    _, d_err = api_delete(f"/macro/events/{int(del_id)}")
+                    if d_err:
+                        st.error(d_err)
+                    else:
+                        st.rerun()
+
+        with form_col:
+            st.subheader("Add Custom News Alert")
+            st.caption("Pin an exact UTC time (UAE is UTC+4) to block entries +/-30 mins around it.")
+            with st.form("manual_macro_event_form", clear_on_submit=True):
+                ev_name = st.text_input("News Name", placeholder="E.g., US Non-Farm Payrolls (NFP)")
+                ev_ccy = st.selectbox("Currency", ["USD", "EUR", "GBP", "JPY"])
+                ev_impact = st.selectbox("Impact", ["HIGH", "MEDIUM"])
+                default_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT13:30:00Z")
+                ev_time = st.text_input("Scheduled UTC (13:30 UTC = 17:30 UAE)", value=default_ts)
+                ev_fcst = st.text_input("Forecast (Optional)", placeholder="E.g., 180K or 0.3%")
+                ev_prev = st.text_input("Previous (Optional)", placeholder="E.g., 223K or 0.2%")
+                add_btn = st.form_submit_button("Save News Alert", type="primary", width="stretch")
+
+                if add_btn:
+                    if not ev_name.strip():
+                        st.warning("Enter a news name.")
+                    else:
+                        aff = ["XAUUSD", "EURUSD"] if ev_ccy == "USD" else ["EURUSD"]
+                        payload = {
+                            "event_name": ev_name.strip(),
+                            "currency": ev_ccy,
+                            "impact": ev_impact,
+                            "scheduled_utc": ev_time.strip(),
+                            "forecast": ev_fcst.strip() or None,
+                            "previous": ev_prev.strip() or None,
+                            "affected_symbols": aff,
+                        }
+                        _, p_err = api_post("/macro/events", json_body=payload)
+                        if p_err:
+                            st.error(p_err)
+                        else:
+                            st.success("News alert saved!")
+                            st.rerun()
+
+# ==============================================================================
+# TAB 4: PHASE 1.5 CHAT WITH JOURNAL
 # ==============================================================================
 with tab_chat:
-    st.subheader("Interrogate Your Trading Journal (`gemini-4-hydrogen` + SQLite Tools)")
-    st.caption("Ask questions about your win rates, emotional leaks, XAU/USD vs. EUR/USD edge, or The5ers drawdown buffer.")
+    st.subheader("Ask Questions About Your Trading History")
+    st.caption("Ask about your win rates, Good vs. Bad Trade process scores, XAU/USD vs. EUR/USD performance, or The5ers drawdown buffer.")
 
     if "journal_chat_messages" not in st.session_state:
         st.session_state.journal_chat_messages = []
 
     quick_prompts = [
         "Compare my win rate and net PnL when I follow my plan vs. when I break it.",
-        "Which session and instrument has my highest expectancy over the last 30 days?",
-        "Show my last 5 losing trades and summarize the recurring mistake tags.",
+        "Which session and instrument makes me the most money over the last 30 days?",
+        "Show my last 5 losing trades and summarize what went wrong.",
     ]
     q_cols = st.columns(3)
     for idx, qp in enumerate(quick_prompts):
         if q_cols[idx].button(qp, key=f"qp_{idx}", width="stretch"):
             st.session_state.journal_chat_messages.append({"role": "user", "content": qp})
-            with st.spinner("Querying SQLite journal..."):
+            with st.spinner("Checking your trade history..."):
                 res, err = api_post(
                     "/journal/chat",
                     json_body={"messages": st.session_state.journal_chat_messages, "lookback_days": lookback_days},
@@ -450,7 +726,7 @@ with tab_chat:
     user_prompt = st.chat_input("Ask anything about your trades, sessions, setups, or The5ers risk...")
     if user_prompt:
         st.session_state.journal_chat_messages.append({"role": "user", "content": user_prompt})
-        with st.spinner("Querying your trade history..."):
+        with st.spinner("Checking your trade history..."):
             res, err = api_post(
                 "/journal/chat",
                 json_body={"messages": st.session_state.journal_chat_messages, "lookback_days": lookback_days},
@@ -462,12 +738,12 @@ with tab_chat:
         st.rerun()
 
 # ==============================================================================
-# TAB 4: EDGE & SESSION ANALYTICS
+# TAB 5: EDGE & SESSION ANALYTICS
 # ==============================================================================
 with tab_analytics:
     metrics, m_err = api_get("/analytics/metrics", params={"lookback_days": lookback_days})
     if m_err or not metrics or metrics.get("total_trades") == 0:
-        st.info("Sync and journal trades to populate session, setup, and emotional expectancy charts.")
+        st.info("Sync and journal trades to populate session, setup, and emotional performance charts.")
     else:
         ov = metrics["overall"]
         c1, c2, c3, c4 = st.columns(4)
@@ -489,8 +765,8 @@ with tab_analytics:
                     x="Session",
                     y="net_pnl_usd",
                     color="win_rate_pct",
-                    title="Net PnL ($) & Win Rate by Session",
-                    labels={"net_pnl_usd": "Net PnL ($)", "win_rate_pct": "Win Rate %"},
+                    title="Net Profit ($) & Win Rate by Session",
+                    labels={"net_pnl_usd": "Net Profit ($)", "win_rate_pct": "Win Rate %"},
                 )
                 st.plotly_chart(fig_sess, width="stretch")
             else:
@@ -508,25 +784,25 @@ with tab_analytics:
                     x="Emotional State",
                     y="net_pnl_usd",
                     color="trades",
-                    title="Net PnL ($) by Emotional State",
-                    labels={"net_pnl_usd": "Net PnL ($)", "trades": "Trade Count"},
+                    title="Net Profit ($) by Emotional State",
+                    labels={"net_pnl_usd": "Net Profit ($)", "trades": "Trade Count"},
                 )
                 st.plotly_chart(fig_emo, width="stretch")
             else:
-                st.info("Complete an AI debrief in the Journal tab to unlock Emotional State analytics.")
+                st.info("Complete an entry questionnaire or debrief to unlock Emotional State analytics.")
 
         if metrics.get("top_mistakes"):
             st.subheader("Top Execution Mistakes")
             st.bar_chart(pd.Series(metrics["top_mistakes"], name="Count"))
 
 # ==============================================================================
-# TAB 5: BEHAVIORAL LEAK AUDIT
+# TAB 6: BEHAVIORAL LEAK AUDIT
 # ==============================================================================
 with tab_audit:
-    st.subheader("AI Edge & Behavioral Leak Diagnosis")
-    st.write("Uses `gemini-4-hydrogen` (`thinking_level='high'`) to cross-examine your win rates, emotional leaks, and The5ers risk rules.")
-    if st.button("🔍 Run Deep Behavioral Leak Audit", type="primary"):
-        with st.spinner("Auditing trade history, session expectancy, and rule violations..."):
+    st.subheader("AI Performance & Habit Review")
+    st.write("Reviews your win rates, emotional mistakes, and The5ers risk rules to show where you make and lose money.")
+    if st.button("🔍 Run Full Habit & Profit Review", type="primary"):
+        with st.spinner("Reviewing trade history, session profits, and rule violations..."):
             audit_res, err = api_post("/analytics/audit", params={"lookback_days": lookback_days})
             if err:
                 st.error(f"Audit failed: {err}")

@@ -1,164 +1,235 @@
 import os
-import re
 import logging
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import MetaTrader5 as mt5
+from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from core.database import SessionLocal, init_db, load_risk_rules
 from core.models import Trade, DailyAccountSnapshot
 from core.schemas import DrawdownStatus
 
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mt5_sync")
 
 
 class MT5SyncConnector:
+    """Connects to MetaTrader 5 terminal, syncs live OPEN + CLOSED positions, and tracks The5ers drawdown."""
+
     def __init__(self):
+        self.login = int(os.getenv("MT5_LOGIN", "0"))
+        self.password = os.getenv("MT5_PASSWORD", "")
+        self.server = os.getenv("MT5_SERVER", "")
+        self.terminal_path = os.getenv("MT5_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
         self.rules = load_risk_rules()
-        self.login = os.getenv("MT5_LOGIN")
-        self.password = os.getenv("MT5_PASSWORD")
-        self.server = os.getenv("MT5_SERVER")
-        self.mt5_path = os.getenv("MT5_PATH")
 
     def connect(self) -> bool:
-        """Initialize connection to the running MetaTrader 5 terminal."""
+        """Initialize connection to the local MT5 terminal."""
         init_kwargs = {}
-        if self.mt5_path and os.path.exists(self.mt5_path):
-            init_kwargs["path"] = self.mt5_path
-        if self.login and self.password and self.server:
-            init_kwargs["login"] = int(self.login)
-            init_kwargs["password"] = self.password
-            init_kwargs["server"] = self.server
+        if self.terminal_path and os.path.exists(self.terminal_path):
+            init_kwargs["path"] = self.terminal_path
 
         if not mt5.initialize(**init_kwargs):
             logger.error(f"MT5 initialize() failed, error code: {mt5.last_error()}")
             return False
 
-        account = mt5.account_info()
-        if account is None:
-            logger.error(f"Failed to retrieve MT5 account_info(): {mt5.last_error()}")
+        if self.login and self.password and self.server:
+            authorized = mt5.login(login=self.login, password=self.password, server=self.server)
+            if not authorized:
+                logger.error(f"MT5 login failed for account {self.login}, error: {mt5.last_error()}")
+                mt5.shutdown()
+                return False
+
+        acc = mt5.account_info()
+        if acc is None:
+            logger.error("Failed to retrieve MT5 account_info().")
             mt5.shutdown()
             return False
 
-        logger.info(f"Connected to MT5 | Account: {account.login} | Server: {account.server} | Equity: {account.equity:.2f}")
+        logger.info(f"Connected to MT5 | Account: {acc.login} | Balance: ${acc.balance:.2f} | Equity: ${acc.equity:.2f}")
         return True
 
-    def disconnect(self) -> None:
+    def disconnect(self):
         mt5.shutdown()
 
-    @staticmethod
-    def _extract_sl_from_comment(comment: str) -> Optional[float]:
-        """Parse MT5 auto-generated stop-loss tags like '[sl 2645.50]' from closing deals."""
-        if not comment:
+    def _estimate_sl_risk_usd(self, symbol: str, entry_price: float, stop_loss: Optional[float], volume: float) -> Optional[float]:
+        """Calculate exact USD dollar risk from entry_price to stop_loss using MT5 symbol tick specs."""
+        if not stop_loss or stop_loss <= 0:
             return None
-        match = re.search(r"\[sl\s+([0-9.]+)\]", comment, re.IGNORECASE)
-        return float(match.group(1)) if match else None
-
-    def _calculate_r_multiple(
-        self, symbol: str, direction: str, volume: float, entry_price: float, stop_loss: Optional[float], net_profit: float
-    ) -> tuple[Optional[float], Optional[float]]:
-        """Compute initial USD risk and realized R-multiple using MT5 symbol contract specs."""
-        if not stop_loss or stop_loss <= 0 or entry_price == stop_loss:
-            return None, None
 
         sym_info = mt5.symbol_info(symbol)
-        if sym_info is None or sym_info.trade_tick_size <= 0 or sym_info.trade_tick_value <= 0:
-            return None, None
+        if sym_info is None or sym_info.trade_tick_size == 0:
+            return None
 
-        price_risk = (entry_price - stop_loss) if direction == "BUY" else (stop_loss - entry_price)
-        if price_risk <= 0:
-            return None, None
+        price_diff = abs(entry_price - stop_loss)
+        ticks = price_diff / sym_info.trade_tick_size
+        risk_usd = ticks * sym_info.trade_tick_value * volume
+        return round(risk_usd, 2)
 
-        ticks_at_risk = price_risk / sym_info.trade_tick_size
-        risk_usd = round(ticks_at_risk * sym_info.trade_tick_value * volume, 2)
-        if risk_usd <= 0:
-            return None, None
+    def sync_open_positions(self, db: Session) -> list[dict]:
+        """
+        Poll mt5.positions_get() for currently active positions.
+        - Upserts live OPEN trades in SQLite so the Stage 1 Entry Questionnaire pops up immediately.
+        - Returns all currently open positions with live floating PnL and SL risk.
+        """
+        positions = mt5.positions_get()
+        if positions is None:
+            logger.warning(f"mt5.positions_get() returned None: {mt5.last_error()}")
+            return []
 
-        r_multiple = round(net_profit / risk_usd, 2)
-        return risk_usd, r_multiple
+        active_tickets = set()
+        open_summaries = []
 
-    def sync_closed_trades(self, db: Session, lookback_days: int = 30) -> int:
-        """Fetch historical deals from MT5, reconstruct closed positions, and upsert into SQLite."""
-        date_to = datetime.now(timezone.utc) + timedelta(days=1)
-        date_from = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        for pos in positions:
+            ticket = int(pos.ticket)
+            active_tickets.add(ticket)
+            direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
+            open_dt = datetime.fromtimestamp(pos.time, tz=timezone.utc)
+            sl_val = float(pos.sl) if pos.sl and pos.sl > 0 else None
+            tp_val = float(pos.tp) if pos.tp and pos.tp > 0 else None
+            risk_usd = self._estimate_sl_risk_usd(pos.symbol, float(pos.price_open), sl_val, float(pos.volume))
 
-        deals = mt5.history_deals_get(date_from, date_to)
+            existing = db.query(Trade).filter(Trade.mt5_position_id == ticket).first()
+            if existing:
+                existing.status = "OPEN"
+                existing.stop_loss = sl_val
+                existing.take_profit = tp_val
+                existing.gross_profit = round(float(pos.profit), 2)
+                existing.net_profit = round(float(pos.profit) + float(pos.swap), 2)
+                if risk_usd is not None:
+                    existing.risk_amount_usd = risk_usd
+            else:
+                existing = Trade(
+                    mt5_position_id=ticket,
+                    symbol=pos.symbol,
+                    direction=direction,
+                    volume=float(pos.volume),
+                    entry_price=float(pos.price_open),
+                    stop_loss=sl_val,
+                    take_profit=tp_val,
+                    open_time=open_dt,
+                    swap=round(float(pos.swap), 2),
+                    gross_profit=round(float(pos.profit), 2),
+                    net_profit=round(float(pos.profit) + float(pos.swap), 2),
+                    risk_amount_usd=risk_usd,
+                    status="OPEN",
+                )
+                db.add(existing)
+                logger.info(f"Detected new LIVE MT5 position #{ticket} ({pos.symbol} {direction} {pos.volume} lots)")
+
+            db.flush()
+            je = existing.journal_entry
+            open_summaries.append(
+                {
+                    "mt5_position_id": ticket,
+                    "symbol": pos.symbol,
+                    "direction": direction,
+                    "volume": float(pos.volume),
+                    "entry_price": float(pos.price_open),
+                    "stop_loss": sl_val,
+                    "take_profit": tp_val,
+                    "floating_pnl": round(float(pos.profit) + float(pos.swap), 2),
+                    "risk_amount_usd": risk_usd,
+                    "open_time": open_dt,
+                    "stage1_completed": bool(je and je.stage1_completed_at is not None),
+                    "setup_type": je.setup_type if je else None,
+                    "entry_thesis": je.entry_thesis if je else None,
+                    "invalidation_plan": je.invalidation_plan if je else None,
+                    "pre_trade_emotion": je.pre_trade_emotion if je else None,
+                    "entry_chart_path": je.entry_chart_path if je else None,
+                }
+            )
+
+        db.commit()
+        return open_summaries
+
+    def sync_closed_trades(self, db: Session, lookback_days: int = 30) -> tuple[int, list[int]]:
+        """
+        Fetch closed deals from MT5 history, reconstruct round-trip positions, and upsert into SQLite.
+        Returns (total_closed_upserted, newly_closed_position_ids_with_stage1_journal).
+        """
+        utc_to = datetime.now(timezone.utc) + timedelta(days=1)
+        utc_from = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+
+        deals = mt5.history_deals_get(utc_from, utc_to)
         if deals is None:
-            logger.warning(f"No deals returned or error: {mt5.last_error()}")
-            return 0
+            logger.warning(f"No deals returned from MT5: {mt5.last_error()}")
+            return 0, []
 
-        # Group deals by position_id (ignore balance/credit operations where position_id == 0)
-        positions_map = defaultdict(list)
+        positions_map: dict[int, list] = {}
         for d in deals:
-            if d.position_id > 0 and d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
-                positions_map[d.position_id].append(d)
+            if d.entry in (mt5.DEAL_ENTRY_IN, mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT) and d.position_id > 0:
+                positions_map.setdefault(d.position_id, []).append(d)
 
         synced_count = 0
-        for position_id, pos_deals in positions_map.items():
-            pos_deals.sort(key=lambda x: x.time_msc)
+        newly_closed_for_verdict: list[int] = []
 
+        for pos_id, pos_deals in positions_map.items():
+            pos_deals.sort(key=lambda x: x.time)
             in_deals = [d for d in pos_deals if d.entry == mt5.DEAL_ENTRY_IN]
-            out_deals = [d for d in pos_deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)]
+            out_deals = [d for d in pos_deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)]
 
             if not in_deals or not out_deals:
-                continue  # Position is still open or incomplete
-
-            total_in_vol = sum(d.volume for d in in_deals)
-            total_out_vol = sum(d.volume for d in out_deals)
-            if round(total_out_vol, 4) < round(total_in_vol, 4):
-                continue  # Partially closed; wait for full exit
+                continue
 
             first_in = in_deals[0]
             last_out = out_deals[-1]
-            symbol = first_in.symbol
-            direction = "BUY" if first_in.type == mt5.DEAL_TYPE_BUY else "SELL"
 
-            # Volume-weighted average entry & exit prices
-            entry_price = sum(d.price * d.volume for d in in_deals) / total_in_vol
-            exit_price = sum(d.price * d.volume for d in out_deals) / total_out_vol
+            direction = "BUY" if first_in.type == mt5.DEAL_TYPE_BUY else "SELL"
+            total_volume = sum(d.volume for d in in_deals)
+            entry_price = sum(d.price * d.volume for d in in_deals) / total_volume
+            exit_price = sum(d.price * d.volume for d in out_deals) / sum(d.volume for d in out_deals)
 
             commission = sum(d.commission for d in pos_deals)
             swap = sum(d.swap for d in pos_deals)
-            gross_profit = sum(d.profit for d in out_deals)
+            gross_profit = sum(d.profit for d in pos_deals)
             net_profit = round(gross_profit + commission + swap, 2)
-
-            stop_loss = self._extract_sl_from_comment(last_out.comment)
-            risk_usd, r_multiple = self._calculate_r_multiple(
-                symbol=symbol,
-                direction=direction,
-                volume=total_in_vol,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                net_profit=net_profit,
-            )
 
             open_time = datetime.fromtimestamp(first_in.time, tz=timezone.utc)
             close_time = datetime.fromtimestamp(last_out.time, tz=timezone.utc)
 
-            existing = db.query(Trade).filter(Trade.mt5_position_id == position_id).first()
+            # Check if SL was already captured while OPEN, otherwise parse from comment
+            existing = db.query(Trade).filter(Trade.mt5_position_id == pos_id).first()
+            stop_loss = existing.stop_loss if (existing and existing.stop_loss) else None
+            if not stop_loss and first_in.comment and "sl" in first_in.comment.lower():
+                try:
+                    parts = first_in.comment.lower().split("sl")
+                    stop_loss = float(parts[1].strip().split()[0])
+                except (IndexError, ValueError):
+                    stop_loss = None
+
+            risk_usd = (
+                existing.risk_amount_usd
+                if (existing and existing.risk_amount_usd)
+                else self._estimate_sl_risk_usd(first_in.symbol, entry_price, stop_loss, total_volume)
+            )
+            r_multiple = round(net_profit / risk_usd, 2) if (risk_usd and risk_usd > 0) else None
+
             if existing:
-                if existing.status != "CLOSED":
-                    existing.exit_price = round(exit_price, 5)
-                    existing.close_time = close_time
-                    existing.commission = round(commission, 2)
-                    existing.swap = round(swap, 2)
-                    existing.gross_profit = round(gross_profit, 2)
-                    existing.net_profit = net_profit
-                    existing.stop_loss = stop_loss or existing.stop_loss
-                    existing.risk_amount_usd = risk_usd
-                    existing.r_multiple = r_multiple
-                    existing.status = "CLOSED"
-                    synced_count += 1
+                was_open = existing.status == "OPEN"
+                existing.exit_price = round(exit_price, 5)
+                existing.close_time = close_time
+                existing.commission = round(commission, 2)
+                existing.swap = round(swap, 2)
+                existing.gross_profit = round(gross_profit, 2)
+                existing.net_profit = net_profit
+                existing.r_multiple = r_multiple
+                existing.status = "CLOSED"
+
+                # Flag if this trade just closed and needs its Stage 2 Good/Bad Trade verdict
+                je = existing.journal_entry
+                if (was_open or (je and je.stage1_completed_at and not je.process_verdict)):
+                    newly_closed_for_verdict.append(pos_id)
             else:
-                trade = Trade(
-                    mt5_position_id=position_id,
-                    symbol=symbol,
+                trade_row = Trade(
+                    mt5_position_id=pos_id,
+                    symbol=first_in.symbol,
                     direction=direction,
-                    volume=round(total_in_vol, 2),
+                    volume=round(total_volume, 2),
                     entry_price=round(entry_price, 5),
                     exit_price=round(exit_price, 5),
                     stop_loss=stop_loss,
@@ -172,27 +243,19 @@ class MT5SyncConnector:
                     r_multiple=r_multiple,
                     status="CLOSED",
                 )
-                db.add(trade)
-                synced_count += 1
+                db.add(trade_row)
+
+            synced_count += 1
 
         db.commit()
-        logger.info(f"Synced {synced_count} new/updated closed trades into SQLite.")
-        return synced_count
+        logger.info(f"Synced {synced_count} closed positions from MT5 into SQLite.")
+        return synced_count, newly_closed_for_verdict
 
     def update_drawdown_status(self, db: Session) -> DrawdownStatus:
-        """
-        Compute live The5ers High Stakes drawdown buffers:
-        - Daily 5% limit: anchored at 00:00 server time on max(day_start_balance, day_start_equity)
-        - Static 10% limit: anchored permanently at starting_balance * (1 - 0.10)
-        """
-        account = mt5.account_info()
-        if account is None:
+        """Calculate real-time The5ers High Stakes Daily (5%) and Static (10%) drawdown buffers."""
+        acc = mt5.account_info()
+        if acc is None:
             raise RuntimeError("MT5 account_info() unavailable.")
-
-        # Use MT5 server tick time to align with 00:00 broker server midnight reset
-        tick = mt5.symbol_info_tick("EURUSD") or mt5.symbol_info_tick("XAUUSD")
-        server_now = datetime.fromtimestamp(tick.time, tz=timezone.utc) if tick else datetime.now(timezone.utc)
-        trading_date = server_now.strftime("%Y-%m-%d")
 
         starting_balance = float(self.rules["account"]["starting_balance"])
         daily_limit_pct = float(self.rules["drawdown_limits"]["daily_loss_pct"])
@@ -200,93 +263,76 @@ class MT5SyncConnector:
         static_limit_pct = float(self.rules["drawdown_limits"]["max_static_drawdown_pct"])
         static_soft_pct = float(self.rules["drawdown_limits"]["max_soft_lock_pct"])
 
-        snapshot = db.query(DailyAccountSnapshot).filter(
-            DailyAccountSnapshot.trading_date == trading_date
-        ).first()
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        snapshot = db.query(DailyAccountSnapshot).filter(DailyAccountSnapshot.trading_date == today_str).first()
 
         if not snapshot:
             snapshot = DailyAccountSnapshot(
-                trading_date=trading_date,
-                day_start_balance=account.balance,
-                day_start_equity=account.equity,
-                current_balance=account.balance,
-                current_equity=account.equity,
-                lowest_equity_today=account.equity,
+                trading_date=today_str,
+                day_start_balance=float(acc.balance),
+                day_start_equity=float(acc.equity),
+                current_balance=float(acc.balance),
+                current_equity=float(acc.equity),
+                lowest_equity_today=float(acc.equity),
             )
             db.add(snapshot)
         else:
-            snapshot.current_balance = account.balance
-            snapshot.current_equity = account.equity
-            snapshot.lowest_equity_today = min(snapshot.lowest_equity_today, account.equity)
+            snapshot.current_balance = float(acc.balance)
+            snapshot.current_equity = float(acc.equity)
+            if acc.equity < snapshot.lowest_equity_today:
+                snapshot.lowest_equity_today = float(acc.equity)
 
-        # The5ers High Stakes Daily Reference Level = higher of day-start balance or equity
         day_reference = max(snapshot.day_start_balance, snapshot.day_start_equity)
         daily_loss_limit_usd = round(day_reference * (daily_limit_pct / 100.0), 2)
-        daily_floor_usd = day_reference - daily_loss_limit_usd
+        daily_floor_equity = day_reference - daily_loss_limit_usd
+        daily_dd_remaining_usd = round(max(0.0, acc.equity - daily_floor_equity), 2)
+        daily_dd_used_pct = round(max(0.0, ((day_reference - acc.equity) / day_reference) * 100.0), 2)
 
-        daily_drawdown_usd = max(0.0, day_reference - account.equity)
-        daily_used_pct = round((daily_drawdown_usd / day_reference) * 100.0, 2) if day_reference > 0 else 0.0
-        daily_remaining_usd = round(max(0.0, account.equity - daily_floor_usd), 2)
+        static_floor_equity = round(starting_balance * (1.0 - static_limit_pct / 100.0), 2)
+        static_dd_remaining_usd = round(max(0.0, acc.equity - static_floor_equity), 2)
+        static_dd_used_pct = round(max(0.0, ((starting_balance - acc.equity) / starting_balance) * 100.0), 2)
 
-        # Static Max Drawdown = 10% below initial account starting balance
-        static_max_loss_usd = starting_balance * (static_limit_pct / 100.0)
-        static_floor_usd = round(starting_balance - static_max_loss_usd, 2)
-        static_drawdown_usd = max(0.0, starting_balance - account.equity)
-        static_used_pct = round((static_drawdown_usd / starting_balance) * 100.0, 2) if starting_balance > 0 else 0.0
-        static_remaining_usd = round(max(0.0, account.equity - static_floor_usd), 2)
-
-        # Evaluate soft-lock circuit breakers
         soft_lock = False
         lock_reason = None
-        if daily_used_pct >= daily_soft_pct:
+        if daily_dd_used_pct >= daily_soft_pct:
             soft_lock = True
-            lock_reason = f"Daily drawdown ({daily_used_pct}%) reached soft-lock buffer ({daily_soft_pct}%)."
-        elif static_used_pct >= static_soft_pct:
+            lock_reason = f"Daily drawdown ({daily_dd_used_pct}%) hit soft-lock threshold ({daily_soft_pct}%)."
+        elif static_dd_used_pct >= static_soft_pct:
             soft_lock = True
-            lock_reason = f"Static drawdown ({static_used_pct}%) reached soft-lock buffer ({static_soft_pct}%)."
+            lock_reason = f"Static drawdown ({static_dd_used_pct}%) hit soft-lock threshold ({static_soft_pct}%)."
 
-        snapshot.daily_drawdown_used_pct = daily_used_pct
-        snapshot.static_drawdown_used_pct = static_used_pct
+        snapshot.daily_drawdown_used_pct = daily_dd_used_pct
+        snapshot.static_drawdown_used_pct = static_dd_used_pct
         snapshot.is_locked_out = soft_lock
         db.commit()
 
         return DrawdownStatus(
-            trading_date=trading_date,
+            trading_date=today_str,
             starting_account_balance=starting_balance,
             day_reference_level=round(day_reference, 2),
-            current_equity=round(account.equity, 2),
+            current_equity=round(float(acc.equity), 2),
             daily_loss_limit_usd=daily_loss_limit_usd,
-            daily_drawdown_remaining_usd=daily_remaining_usd,
-            daily_drawdown_used_pct=daily_used_pct,
-            static_drawdown_floor_usd=static_floor_usd,
-            static_drawdown_remaining_usd=static_remaining_usd,
-            static_drawdown_used_pct=static_used_pct,
+            daily_drawdown_remaining_usd=daily_dd_remaining_usd,
+            daily_drawdown_used_pct=daily_dd_used_pct,
+            static_drawdown_floor_usd=static_floor_equity,
+            static_drawdown_remaining_usd=static_dd_remaining_usd,
+            static_drawdown_used_pct=static_dd_used_pct,
             soft_lock_triggered=soft_lock,
             lock_reason=lock_reason,
         )
 
 
-def run_sync_once() -> None:
-    """Standalone CLI entry point to test MT5 sync and verify database writes."""
+if __name__ == "__main__":
     init_db()
     connector = MT5SyncConnector()
-    if not connector.connect():
-        return
-
-    db = SessionLocal()
-    try:
-        synced = connector.sync_closed_trades(db, lookback_days=60)
-        status = connector.update_drawdown_status(db)
-        print("\n=== The5ers High Stakes Live Telemetry ===")
-        print(f"Trades Synced       : {synced}")
-        print(f"Current Equity      : ${status.current_equity:,.2f}")
-        print(f"Daily Buffer Left   : ${status.daily_drawdown_remaining_usd:,.2f} ({status.daily_drawdown_used_pct}% used of 5.0%)")
-        print(f"Static Buffer Left  : ${status.static_drawdown_remaining_usd:,.2f} ({status.static_drawdown_used_pct}% used of 10.0%)")
-        print(f"Circuit Breaker     : {'LOCKED - ' + status.lock_reason if status.soft_lock_triggered else 'ACTIVE (Clear to Trade)'}")
-    finally:
-        db.close()
-        connector.disconnect()
-
-
-if __name__ == "__main__":
-    run_sync_once()
+    if connector.connect():
+        db = SessionLocal()
+        try:
+            open_pos = connector.sync_open_positions(db)
+            closed_count, newly_closed = connector.sync_closed_trades(db, lookback_days=30)
+            dd = connector.update_drawdown_status(db)
+            print(f"Open Positions: {len(open_pos)} | Closed Synced: {closed_count} | Newly Closed: {newly_closed}")
+            print(f"Daily DD Used: {dd.daily_drawdown_used_pct}% (${dd.daily_drawdown_remaining_usd} left)")
+        finally:
+            db.close()
+            connector.disconnect()
