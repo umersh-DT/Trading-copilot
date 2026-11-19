@@ -36,7 +36,7 @@ def format_utc_and_uae(dt: Optional[datetime]) -> Optional[str]:
 
 
 class TradingJournalAgent:
-    """Phase 1.5 Agent: Fast interactive post-trade debrief coach + single-pass journal analyst."""
+    """Phase 1.5 + Phase 3 Analytics Agent: Debrief coach, process-verdict tracker & fast journal analyst."""
 
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
@@ -233,7 +233,10 @@ RULES FOR THIS TURN:
         return result
 
     def compute_performance_metrics(self, db: Session, lookback_days: int = 30) -> dict:
-        """Compute deterministic win rates, expectancy, R-multiples, and mistake frequencies."""
+        """
+        Compute deterministic win rates, expectancy, R-multiples, mistake frequencies,
+        and GOOD_TRADE vs BAD_TRADE process-over-outcome splits.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         trades = (
             db.query(Trade)
@@ -269,6 +272,8 @@ RULES FOR THIS TURN:
         by_session = defaultdict(list)
         by_setup = defaultdict(list)
         by_emotion = defaultdict(list)
+        by_process_verdict = defaultdict(list)
+        by_outcome_quadrant = defaultdict(list)
         mistake_counter = Counter()
         plan_followed_trades = []
         plan_broken_trades = []
@@ -279,7 +284,14 @@ RULES FOR THIS TURN:
                 je = t.journal_entry
                 by_session[je.session or "UNKNOWN"].append(t)
                 by_setup[je.setup_type or "Untagged"].append(t)
-                by_emotion[je.emotional_state or "NEUTRAL"].append(t)
+                by_emotion[je.emotional_state or je.pre_trade_emotion or "NEUTRAL"].append(t)
+
+                verdict_key = je.process_verdict if je.process_verdict in ("GOOD_TRADE", "BAD_TRADE") else "UNGRADED"
+                by_process_verdict[verdict_key].append(t)
+
+                if je.outcome_quadrant:
+                    by_outcome_quadrant[je.outcome_quadrant].append(t)
+
                 if je.mistake_tags:
                     mistake_counter.update(je.mistake_tags)
                 if je.followed_plan:
@@ -288,10 +300,21 @@ RULES FOR THIS TURN:
                     plan_broken_trades.append(t)
             else:
                 by_session["UNJOURNALED"].append(t)
+                by_process_verdict["UNGRADED"].append(t)
+
+        # Compute overall Process Discipline Score (% of graded trades that were GOOD_TRADE)
+        good_count = len(by_process_verdict.get("GOOD_TRADE", []))
+        bad_count = len(by_process_verdict.get("BAD_TRADE", []))
+        graded_total = good_count + bad_count
+        process_discipline_pct = round((good_count / graded_total) * 100.0, 1) if graded_total > 0 else None
 
         return {
             "lookback_days": lookback_days,
+            "total_trades": len(trades),
+            "process_discipline_pct": process_discipline_pct,
             "overall": _summarize_bucket(trades),
+            "by_process_verdict": {k: _summarize_bucket(v) for k, v in by_process_verdict.items()},
+            "by_outcome_quadrant": {k: _summarize_bucket(v) for k, v in by_outcome_quadrant.items()},
             "discipline_split": {
                 "followed_plan": _summarize_bucket(plan_followed_trades),
                 "broke_plan": _summarize_bucket(plan_broken_trades),
@@ -305,10 +328,8 @@ RULES FOR THIS TURN:
 
     def chat_with_journal(self, db: Session, messages: list[ChatMessage], lookback_days: int = 60) -> str:
         """
-        Fast single-pass Q&A over the trader's SQLite journal:
-        Pre-loads deterministic performance metrics, recent trades (with UTC + UAE times),
-        and current The5ers drawdown buffer directly into the prompt with thinking_level='low'
-        so answers return in ~2-3 seconds instead of multi-round-trip tool calling.
+        Fast single-pass Q&A over the trader's SQLite journal including GOOD_TRADE vs BAD_TRADE
+        process verdicts, entry theses, and UTC + UAE (UTC+4) timestamps.
         """
         metrics = self.compute_performance_metrics(db, lookback_days=lookback_days)
 
@@ -336,8 +357,11 @@ RULES FOR THIS TURN:
                     "closed": format_utc_and_uae(t.close_time),
                     "sess": je.session if je else "UNJOURNALED",
                     "setup": je.setup_type if je else None,
-                    "emo": je.emotional_state if je else None,
+                    "thesis": je.entry_thesis if je else None,
+                    "emo": (je.emotional_state or je.pre_trade_emotion) if je else None,
                     "plan_ok": je.followed_plan if je else None,
+                    "process_verdict": je.process_verdict if je else "UNGRADED",
+                    "quadrant": je.outcome_quadrant if je else None,
                     "mistakes": je.mistake_tags if je else [],
                 }
             )
@@ -362,12 +386,14 @@ RULES FOR THIS TURN:
         system_instruction = f"""
 You are the trader's performance coach for a The5ers High Stakes prop account.
 Answer clearly in simple, everyday English using ONLY the verified database snapshot below.
+Pay special attention to **Process Over Outcome** ('GOOD_TRADE' vs 'BAD_TRADE' verdicts and the 4 quadrants:
+GOOD_PROCESS_GOOD_OUTCOME, GOOD_PROCESS_BAD_OUTCOME, BAD_PROCESS_GOOD_OUTCOME [lucky/dangerous], BAD_PROCESS_BAD_OUTCOME).
 Cite exact MT5 trade IDs, dollar amounts, win rates, and R-multiples. Whenever you mention a time, format it as UTC (UAE UTC+4).
 
 THE5ERS RISK STATUS:
 {json.dumps(risk_context)}
 
-AGGREGATED METRICS (LAST {lookback_days} DAYS):
+AGGREGATED METRICS & PROCESS VERDICT BREAKDOWN (LAST {lookback_days} DAYS):
 {json.dumps(metrics)}
 
 RECENT CLOSED TRADES (UP TO 75):
@@ -390,14 +416,14 @@ RECENT CLOSED TRADES (UP TO 75):
         return response.text or "No response generated."
 
     def run_leak_audit(self, db: Session, lookback_days: int = 30) -> str:
-        """Deep diagnostic report across all recent trades."""
+        """Deep diagnostic report across all recent trades including GOOD_TRADE vs BAD_TRADE process discipline."""
         metrics = self.compute_performance_metrics(db, lookback_days=lookback_days)
         if metrics.get("total_trades") == 0:
             return "No closed trades available yet. Sync MT5 trades and log notes before running an audit."
 
         prompt = f"""
 You are the Head Risk & Performance Coach overseeing a trader on a The5ers High Stakes prop account.
-Review the trading performance metrics below and produce a clear, plain-English diagnostic report.
+Review the trading performance metrics below—including the GOOD_TRADE vs BAD_TRADE process splits—and produce a clear, plain-English diagnostic report.
 
 ACCOUNT RISK RULES:
 {json.dumps(self.rules, indent=2)}
@@ -406,8 +432,8 @@ PERFORMANCE METRICS (LAST {lookback_days} DAYS):
 {json.dumps(metrics, indent=2)}
 
 Deliver your audit in three structured sections:
-1. **What Is Working (Verified Edge):** Identify the highest-profit symbol, session, and setup combinations.
-2. **Where Money Is Leaking:** Pinpoint losing sessions, emotional triggers (FOMO/Revenge), or rule violations draining profit.
+1. **What Is Working (Verified Edge & Good Process):** Identify the highest-profit symbol, session, and setup combinations, plus win rate on GOOD_TRADE executions.
+2. **Where Money & Discipline Are Leaking:** Pinpoint BAD_TRADE habits (especially lucky wins on BAD_PROCESS_GOOD_OUTCOME), losing sessions, emotional triggers (FOMO/Revenge), or rule violations draining profit.
 3. **3 Simple Rules for Next Week:** Give 3 concrete, easy-to-follow rules to enforce before entering any trade.
 """
         response = self._call_with_fallback(

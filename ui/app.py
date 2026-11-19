@@ -327,7 +327,7 @@ tab_gatekeeper, tab_journal, tab_macro, tab_chat, tab_analytics, tab_audit = st.
         "📓 Two-Stage Trade Log & Verdicts",
         "🌍 Macro & News Radar",
         "💬 Chat With Journal",
-        "📊 Edge & Session Analytics",
+        "📊 Edge & Process Analytics",
         "🧠 Behavioral Leak Audit",
     ]
 )
@@ -690,7 +690,7 @@ with tab_macro:
                             st.rerun()
 
 # ==============================================================================
-# TAB 4: PHASE 1.5 CHAT WITH JOURNAL
+# TAB 4: PHASE 1.5 + PHASE 3 CHAT WITH JOURNAL
 # ==============================================================================
 with tab_chat:
     st.subheader("Ask Questions About Your Trading History")
@@ -700,9 +700,9 @@ with tab_chat:
         st.session_state.journal_chat_messages = []
 
     quick_prompts = [
-        "Compare my win rate and net PnL when I follow my plan vs. when I break it.",
+        "Compare my win rate and net PnL on GOOD TRADES vs. BAD TRADES.",
         "Which session and instrument makes me the most money over the last 30 days?",
-        "Show my last 5 losing trades and summarize what went wrong.",
+        "Show any lucky wins (Bad Trade — Good Outcome) or rule violations I made recently.",
     ]
     q_cols = st.columns(3)
     for idx, qp in enumerate(quick_prompts):
@@ -723,7 +723,7 @@ with tab_chat:
         with st.chat_message("assistant" if m["role"] == "model" else "user"):
             st.markdown(m["content"])
 
-    user_prompt = st.chat_input("Ask anything about your trades, sessions, setups, or The5ers risk...")
+    user_prompt = st.chat_input("Ask anything about your Good/Bad Trades, sessions, setups, or The5ers risk...")
     if user_prompt:
         st.session_state.journal_chat_messages.append({"role": "user", "content": user_prompt})
         with st.spinner("Checking your trade history..."):
@@ -738,20 +738,102 @@ with tab_chat:
         st.rerun()
 
 # ==============================================================================
-# TAB 5: EDGE & SESSION ANALYTICS
+# TAB 5: EDGE, SESSION & PROCESS-OVER-OUTCOME ANALYTICS
 # ==============================================================================
 with tab_analytics:
     metrics, m_err = api_get("/analytics/metrics", params={"lookback_days": lookback_days})
     if m_err or not metrics or metrics.get("total_trades") == 0:
-        st.info("Sync and journal trades to populate session, setup, and emotional performance charts.")
+        st.info("Sync and journal trades to populate session, setup, and Good vs. Bad Trade performance charts.")
     else:
         ov = metrics["overall"]
-        c1, c2, c3, c4 = st.columns(4)
+        disc_pct = metrics.get("process_discipline_pct")
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Total Trades", ov["trades"])
         c2.metric("Win Rate", f"{ov['win_rate_pct']}%")
         c3.metric("Net PnL", f"${ov['net_pnl_usd']:,.2f}")
         c4.metric("Average R", f"{ov['avg_r']}R" if ov["avg_r"] is not None else "N/A")
+        c5.metric("Process Discipline", f"{disc_pct}%" if disc_pct is not None else "N/A")
 
+        st.divider()
+        st.subheader("⚖️ Process-Over-Outcome Breakdown (Good Trade vs. Bad Trade)")
+
+        by_pv = metrics.get("by_process_verdict", {})
+        good_stats = by_pv.get("GOOD_TRADE", {"trades": 0, "win_rate_pct": 0.0, "net_pnl_usd": 0.0, "avg_r": None})
+        bad_stats = by_pv.get("BAD_TRADE", {"trades": 0, "win_rate_pct": 0.0, "net_pnl_usd": 0.0, "avg_r": None})
+
+        pv_c1, pv_c2 = st.columns(2)
+        with pv_c1:
+            st.success(
+                f"**🟢 GOOD TRADES (Rules & Thesis Followed):** `{good_stats['trades']}` trades | "
+                f"Win Rate: **`{good_stats['win_rate_pct']}%`** | Net PnL: **`${good_stats['net_pnl_usd']:+,.2f}`**"
+            )
+        with pv_c2:
+            st.error(
+                f"**🔴 BAD TRADES (Rules Broken / Impulse):** `{bad_stats['trades']}` trades | "
+                f"Win Rate: **`{bad_stats['win_rate_pct']}%`** | Net PnL: **`${bad_stats['net_pnl_usd']:+,.2f}`**"
+            )
+
+        q_col1, q_col2 = st.columns(2)
+        with q_col1:
+            if by_pv:
+                pv_rows = []
+                label_map = {
+                    "GOOD_TRADE": "🟢 Good Trade (Clean Process)",
+                    "BAD_TRADE": "🔴 Bad Trade (Rule Violation)",
+                    "UNGRADED": "⏳ Ungraded",
+                }
+                for key, stats in by_pv.items():
+                    pv_rows.append(
+                        {
+                            "Process Grade": label_map.get(key, key),
+                            "Trades": stats["trades"],
+                            "Win Rate %": stats["win_rate_pct"],
+                            "Net PnL ($)": stats["net_pnl_usd"],
+                        }
+                    )
+                pv_df = pd.DataFrame(pv_rows)
+                fig_pv = px.bar(
+                    pv_df,
+                    x="Process Grade",
+                    y="Net PnL ($)",
+                    color="Win Rate %",
+                    text="Trades",
+                    title="Net Profit ($) & Win Rate by Process Grade",
+                )
+                fig_pv.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig_pv, width="stretch")
+
+        with q_col2:
+            by_quad = metrics.get("by_outcome_quadrant", {})
+            if by_quad:
+                quad_labels = {
+                    "GOOD_PROCESS_GOOD_OUTCOME": "🟢 Good Trade → Profit",
+                    "GOOD_PROCESS_BAD_OUTCOME": "🔵 Good Trade → Loss (Normal)",
+                    "BAD_PROCESS_GOOD_OUTCOME": "🟠 Bad Trade → Lucky Profit (Danger)",
+                    "BAD_PROCESS_BAD_OUTCOME": "🔴 Bad Trade → Loss",
+                }
+                q_rows = [
+                    {
+                        "Quadrant": quad_labels.get(k, k),
+                        "Trades": v["trades"],
+                        "Net PnL ($)": v["net_pnl_usd"],
+                    }
+                    for k, v in by_quad.items()
+                ]
+                q_df = pd.DataFrame(q_rows)
+                fig_quad = px.bar(
+                    q_df,
+                    x="Quadrant",
+                    y="Trades",
+                    color="Net PnL ($)",
+                    title="4-Quadrant Process vs. Outcome Distribution",
+                )
+                fig_quad.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig_quad, width="stretch")
+            else:
+                st.info("Grade closed trades in Tab 2 to populate the 4-Quadrant Process Matrix.")
+
+        st.divider()
         chart_a, chart_b = st.columns(2)
         with chart_a:
             if metrics.get("by_session"):
@@ -800,9 +882,9 @@ with tab_analytics:
 # ==============================================================================
 with tab_audit:
     st.subheader("AI Performance & Habit Review")
-    st.write("Reviews your win rates, emotional mistakes, and The5ers risk rules to show where you make and lose money.")
+    st.write("Reviews your Good vs. Bad Trade process scores, win rates, emotional mistakes, and The5ers risk rules.")
     if st.button("🔍 Run Full Habit & Profit Review", type="primary"):
-        with st.spinner("Reviewing trade history, session profits, and rule violations..."):
+        with st.spinner("Reviewing trade history, process verdicts, session profits, and rule violations..."):
             audit_res, err = api_post("/analytics/audit", params={"lookback_days": lookback_days})
             if err:
                 st.error(f"Audit failed: {err}")
