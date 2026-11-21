@@ -2,23 +2,38 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from core.database import SessionLocal, init_db, load_risk_rules
 from core.models import Trade, DailyAccountSnapshot
-from core.schemas import DrawdownStatus
+from core.schemas import (
+    DrawdownStatus,
+    SessionCountdownStatus,
+    SymbolVolatilityMetrics,
+)
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mt5_sync")
 
+UAE_TZ = timezone(timedelta(hours=4))
+LONDON_TZ = ZoneInfo("Europe/London")
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def fmt_utc_uae_dt(dt: datetime) -> str:
+    utc_dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    uae_dt = utc_dt.astimezone(UAE_TZ)
+    return f"{utc_dt.strftime('%H:%M')} UTC ({uae_dt.strftime('%H:%M')} UAE)"
+
 
 class MT5SyncConnector:
-    """Connects to MetaTrader 5 terminal, syncs live OPEN + CLOSED positions, and tracks The5ers drawdown."""
+    """Connects to MetaTrader 5 terminal, syncs live OPEN + CLOSED positions, tracks drawdown, and measures session volatility."""
 
     def __init__(self):
         self.login = int(os.getenv("MT5_LOGIN", "0"))
@@ -28,7 +43,6 @@ class MT5SyncConnector:
         self.rules = load_risk_rules()
 
     def connect(self) -> bool:
-        """Initialize connection to the local MT5 terminal."""
         init_kwargs = {}
         if self.terminal_path and os.path.exists(self.terminal_path):
             init_kwargs["path"] = self.terminal_path
@@ -50,14 +64,204 @@ class MT5SyncConnector:
             mt5.shutdown()
             return False
 
-        logger.info(f"Connected to MT5 | Account: {acc.login} | Balance: ${acc.balance:.2f} | Equity: ${acc.equity:.2f}")
         return True
 
     def disconnect(self):
         mt5.shutdown()
 
+    # ==========================================================================
+    # DST-AWARE SESSION RADAR & 30-MINUTE PRE-SESSION COUNTDOWN
+    # ==========================================================================
+
+    @staticmethod
+    def get_session_countdown_status(now_utc: Optional[datetime] = None) -> SessionCountdownStatus:
+        utc_now = now_utc or datetime.now(timezone.utc)
+        if utc_now.tzinfo is None:
+            utc_now = utc_now.replace(tzinfo=timezone.utc)
+
+        ldn_now = utc_now.astimezone(LONDON_TZ)
+        ny_now = utc_now.astimezone(NY_TZ)
+
+        ldn_open_utc = ldn_now.replace(hour=8, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        ldn_close_utc = ldn_now.replace(hour=17, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        ny_open_utc = ny_now.replace(hour=8, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        ny_close_utc = ny_now.replace(hour=17, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        asia_open_utc = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        is_ldn_active = ldn_open_utc <= utc_now < ldn_close_utc
+        is_ny_active = ny_open_utc <= utc_now < ny_close_utc
+        is_asia_active = asia_open_utc <= utc_now < ldn_open_utc
+
+        if is_ldn_active and is_ny_active:
+            active_session = "LONDON_NY_OVERLAP"
+            active_label = "🔥 London + New York Overlap (Peak Volume)"
+            is_dead = False
+        elif is_ldn_active:
+            active_session = "LONDON"
+            active_label = "🇬🇧 London Session Active"
+            is_dead = False
+        elif is_ny_active:
+            active_session = "NEW_YORK"
+            active_label = "🇺🇸 New York Session Active"
+            is_dead = False
+        elif is_asia_active:
+            active_session = "ASIA"
+            active_label = "🌏 Asia Session (Range / Liquidity Build)"
+            is_dead = False
+        else:
+            active_session = "DEAD_ZONE"
+            active_label = "⏸️ Post-NY Rollover / Thin Liquidity"
+            is_dead = True
+
+        milestones = [
+            ("London Session Open", ldn_open_utc),
+            ("New York Open (London-NY Overlap)", ny_open_utc),
+            ("London Session Close", ldn_close_utc),
+            ("New York Close / Rollover", ny_close_utc),
+            ("Next London Session Open", ldn_open_utc + timedelta(days=1)),
+        ]
+        future_milestones = [(name, ts) for name, ts in milestones if ts > utc_now]
+        next_name, next_ts = min(future_milestones, key=lambda x: x[1])
+        mins_until = max(1, int(round((next_ts - utc_now).total_seconds() / 60.0)))
+        next_time_str = fmt_utc_uae_dt(next_ts)
+
+        pre_alert = False
+        severity = "INFO"
+        banner_msg = (
+            f"{active_label} | Next: **{next_name}** at `{next_time_str}` (in **{mins_until} min**)."
+        )
+
+        if "New York Open" in next_name and mins_until <= 30:
+            pre_alert = True
+            severity = "WARNING"
+            banner_msg = (
+                f"⚡ **NEW YORK SESSION ABOUT TO START IN {mins_until} MIN** (`{next_time_str}`) — "
+                f"London-NY Overlap ahead! Expect sharp volume surges and stop-hunts; tighten risk."
+            )
+        elif "London Session Open" in next_name and mins_until <= 30:
+            pre_alert = True
+            severity = "WARNING"
+            banner_msg = (
+                f"🔔 **LONDON SESSION ABOUT TO START IN {mins_until} MIN** (`{next_time_str}`) — "
+                f"Get ready! Mark Asian session High/Low liquidity pools and check Macro Radar bias."
+            )
+        elif "London Session Close" in next_name and mins_until <= 30:
+            pre_alert = True
+            severity = "INFO"
+            banner_msg = (
+                f"🌇 **LONDON SESSION CLOSING IN {mins_until} MIN** (`{next_time_str}`) — "
+                f"Watch for London profit-taking reversals before NY afternoon session."
+            )
+        elif is_dead:
+            severity = "DANGER"
+            banner_msg = (
+                f"⚠️ **THIN LIQUIDITY / ROLLOVER WINDOW** — Spreads widen around broker rollover. "
+                f"Next major open: **{next_name}** at `{next_time_str}` (in {mins_until} min)."
+            )
+
+        return SessionCountdownStatus(
+            current_utc_uae=fmt_utc_uae_dt(utc_now),
+            active_session=active_session,
+            active_session_label=active_label,
+            is_dead_zone=is_dead,
+            next_event_name=next_name,
+            next_event_time_utc_uae=next_time_str,
+            minutes_until_next=mins_until,
+            pre_session_alert_active=pre_alert,
+            alert_severity=severity,
+            banner_message=banner_msg,
+        )
+
+    # ==========================================================================
+    # LIVE MT5 VOLUME & ATR VOLATILITY TRACKER
+    # ==========================================================================
+
+    def get_symbol_volatility(self, symbol: str) -> Optional[SymbolVolatilityMetrics]:
+        sym = symbol.upper().strip()
+        sym_info = mt5.symbol_info(sym)
+        tick = mt5.symbol_info_tick(sym)
+        if sym_info is None or tick is None or sym_info.point == 0:
+            return None
+
+        m15_rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M15, 0, 35)
+        d1_rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_D1, 0, 15)
+        if m15_rates is None or len(m15_rates) < 22 or d1_rates is None or len(d1_rates) < 5:
+            return None
+
+        tr_list = []
+        for i in range(1, len(m15_rates)):
+            high = float(m15_rates[i]["high"])
+            low = float(m15_rates[i]["low"])
+            prev_close = float(m15_rates[i - 1]["close"])
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            tr_list.append(tr)
+
+        atr_series = []
+        period = 14
+        for idx in range(period, len(tr_list) + 1):
+            atr_series.append(sum(tr_list[idx - period : idx]) / period)
+
+        atr_current = atr_series[-1]
+        atr_avg20 = sum(atr_series[-20:]) / min(20, len(atr_series))
+        atr_ratio = round(atr_current / atr_avg20, 2) if atr_avg20 > 0 else 1.0
+
+        vols = [int(r["tick_volume"]) for r in m15_rates[-21:-1]]
+        vol_avg20 = sum(vols) / len(vols) if vols else 1.0
+        vol_current = max(int(m15_rates[-1]["tick_volume"]), int(m15_rates[-2]["tick_volume"]))
+        vol_ratio = round(vol_current / vol_avg20, 2) if vol_avg20 > 0 else 1.0
+
+        pip_size = sym_info.point * 10.0
+
+        today_bar = d1_rates[-1]
+        today_range_pips = round((float(today_bar["high"]) - float(today_bar["low"])) / pip_size, 1)
+        past_days = d1_rates[:-1]
+        adr_14d_pips = round(
+            sum((float(b["high"]) - float(b["low"])) / pip_size for b in past_days) / len(past_days),
+            1,
+        )
+        adr_used_pct = round((today_range_pips / adr_14d_pips) * 100.0, 1) if adr_14d_pips > 0 else 0.0
+
+        if atr_ratio < 0.72 and vol_ratio < 0.8:
+            regime = "DEAD_COMPRESSED"
+            summary = f"Quiet / Tight Range ({atr_ratio}x ATR, {vol_ratio}x vol) — avoid breakouts; wait for session open."
+        elif atr_ratio >= 1.35 or vol_ratio >= 1.5:
+            regime = "HIGH_EXPANSION"
+            summary = f"High Momentum & Volume ({atr_ratio}x ATR, {vol_ratio}x vol) — fast moves; size carefully & respect SL."
+        else:
+            regime = "NORMAL_HEALTHY"
+            summary = f"Healthy Session Flow ({atr_ratio}x ATR, {vol_ratio}x vol, {adr_used_pct}% of daily range used)."
+
+        return SymbolVolatilityMetrics(
+            symbol=sym,
+            bid_price=round(float(tick.bid), sym_info.digits),
+            spread_points=int(sym_info.spread),
+            atr_15m_current=round(atr_current, sym_info.digits),
+            atr_15m_avg20=round(atr_avg20, sym_info.digits),
+            atr_expansion_ratio=atr_ratio,
+            volume_current=vol_current,
+            volume_avg20=round(vol_avg20, 1),
+            volume_surge_ratio=vol_ratio,
+            today_range_pips=today_range_pips,
+            adr_14d_pips=adr_14d_pips,
+            adr_used_pct=adr_used_pct,
+            volatility_regime=regime,
+            plain_english_summary=summary,
+        )
+
+    def get_market_volatility(self, symbols: Optional[list[str]] = None) -> list[SymbolVolatilityMetrics]:
+        target_symbols = symbols or ["XAUUSD", "EURUSD"]
+        results = []
+        for s in target_symbols:
+            metrics = self.get_symbol_volatility(s)
+            if metrics:
+                results.append(metrics)
+        return results
+
+    # ==========================================================================
+    # MT5 OPEN + CLOSED POSITION SYNC & AUTO-GRADING CANDIDATES
+    # ==========================================================================
+
     def _estimate_sl_risk_usd(self, symbol: str, entry_price: float, stop_loss: Optional[float], volume: float) -> Optional[float]:
-        """Calculate exact USD dollar risk from entry_price to stop_loss using MT5 symbol tick specs."""
         if not stop_loss or stop_loss <= 0:
             return None
 
@@ -71,22 +275,15 @@ class MT5SyncConnector:
         return round(risk_usd, 2)
 
     def sync_open_positions(self, db: Session) -> list[dict]:
-        """
-        Poll mt5.positions_get() for currently active positions.
-        - Upserts live OPEN trades in SQLite so the Stage 1 Entry Questionnaire pops up immediately.
-        - Returns all currently open positions with live floating PnL and SL risk.
-        """
         positions = mt5.positions_get()
         if positions is None:
             logger.warning(f"mt5.positions_get() returned None: {mt5.last_error()}")
             return []
 
-        active_tickets = set()
         open_summaries = []
 
         for pos in positions:
             ticket = int(pos.ticket)
-            active_tickets.add(ticket)
             direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
             open_dt = datetime.fromtimestamp(pos.time, tz=timezone.utc)
             sl_val = float(pos.sl) if pos.sl and pos.sl > 0 else None
@@ -147,10 +344,29 @@ class MT5SyncConnector:
         db.commit()
         return open_summaries
 
+    @staticmethod
+    def get_ungraded_closed_position_ids(db: Session, limit: int = 10) -> list[int]:
+        """Return MT5 position IDs of closed trades that do not yet have a GOOD_TRADE/BAD_TRADE verdict."""
+        rows = (
+            db.query(Trade)
+            .options(joinedload(Trade.journal_entry))
+            .filter(Trade.status == "CLOSED")
+            .order_by(Trade.close_time.desc())
+            .all()
+        )
+        ungraded = []
+        for t in rows:
+            if not t.journal_entry or not t.journal_entry.process_verdict:
+                ungraded.append(t.mt5_position_id)
+                if len(ungraded) >= limit:
+                    break
+        return ungraded
+
     def sync_closed_trades(self, db: Session, lookback_days: int = 30) -> tuple[int, list[int]]:
         """
-        Fetch closed deals from MT5 history, reconstruct round-trip positions, and upsert into SQLite.
-        Returns (total_closed_upserted, newly_closed_position_ids_with_stage1_journal).
+        Sync closed round-trip positions from MT5 history.
+        Returns (synced_count, position_ids_needing_automatic_verdict).
+        Every newly closed or still-ungraded closed trade is queued for automatic GOOD/BAD grading.
         """
         utc_to = datetime.now(timezone.utc) + timedelta(days=1)
         utc_from = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -158,7 +374,7 @@ class MT5SyncConnector:
         deals = mt5.history_deals_get(utc_from, utc_to)
         if deals is None:
             logger.warning(f"No deals returned from MT5: {mt5.last_error()}")
-            return 0, []
+            return 0, self.get_ungraded_closed_position_ids(db, limit=10)
 
         positions_map: dict[int, list] = {}
         for d in deals:
@@ -166,7 +382,7 @@ class MT5SyncConnector:
                 positions_map.setdefault(d.position_id, []).append(d)
 
         synced_count = 0
-        newly_closed_for_verdict: list[int] = []
+        needs_auto_verdict: list[int] = []
 
         for pos_id, pos_deals in positions_map.items():
             pos_deals.sort(key=lambda x: x.time)
@@ -192,7 +408,6 @@ class MT5SyncConnector:
             open_time = datetime.fromtimestamp(first_in.time, tz=timezone.utc)
             close_time = datetime.fromtimestamp(last_out.time, tz=timezone.utc)
 
-            # Check if SL was already captured while OPEN, otherwise parse from comment
             existing = db.query(Trade).filter(Trade.mt5_position_id == pos_id).first()
             stop_loss = existing.stop_loss if (existing and existing.stop_loss) else None
             if not stop_loss and first_in.comment and "sl" in first_in.comment.lower():
@@ -220,10 +435,9 @@ class MT5SyncConnector:
                 existing.r_multiple = r_multiple
                 existing.status = "CLOSED"
 
-                # Flag if this trade just closed and needs its Stage 2 Good/Bad Trade verdict
                 je = existing.journal_entry
-                if (was_open or (je and je.stage1_completed_at and not je.process_verdict)):
-                    newly_closed_for_verdict.append(pos_id)
+                if was_open or not je or not je.process_verdict:
+                    needs_auto_verdict.append(pos_id)
             else:
                 trade_row = Trade(
                     mt5_position_id=pos_id,
@@ -244,15 +458,15 @@ class MT5SyncConnector:
                     status="CLOSED",
                 )
                 db.add(trade_row)
+                needs_auto_verdict.append(pos_id)
 
             synced_count += 1
 
         db.commit()
-        logger.info(f"Synced {synced_count} closed positions from MT5 into SQLite.")
-        return synced_count, newly_closed_for_verdict
+        logger.info(f"Synced {synced_count} closed positions from MT5 ({len(needs_auto_verdict)} queued for auto-grading).")
+        return synced_count, needs_auto_verdict
 
     def update_drawdown_status(self, db: Session) -> DrawdownStatus:
-        """Calculate real-time The5ers High Stakes Daily (5%) and Static (10%) drawdown buffers."""
         acc = mt5.account_info()
         if acc is None:
             raise RuntimeError("MT5 account_info() unavailable.")
@@ -320,19 +534,3 @@ class MT5SyncConnector:
             soft_lock_triggered=soft_lock,
             lock_reason=lock_reason,
         )
-
-
-if __name__ == "__main__":
-    init_db()
-    connector = MT5SyncConnector()
-    if connector.connect():
-        db = SessionLocal()
-        try:
-            open_pos = connector.sync_open_positions(db)
-            closed_count, newly_closed = connector.sync_closed_trades(db, lookback_days=30)
-            dd = connector.update_drawdown_status(db)
-            print(f"Open Positions: {len(open_pos)} | Closed Synced: {closed_count} | Newly Closed: {newly_closed}")
-            print(f"Daily DD Used: {dd.daily_drawdown_used_pct}% (${dd.daily_drawdown_remaining_usd} left)")
-        finally:
-            db.close()
-            connector.disconnect()

@@ -74,7 +74,7 @@ class JournalEntry(Base):
     stage1_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Stage 2: Post-Close Structured Classification & Process Verdict
-    session: Mapped[Optional[str]] = mapped_column(String(25), nullable=True)  # ASIA, LONDON, NEW_YORK, LONDON_NY_OVERLAP
+    session: Mapped[Optional[str]] = mapped_column(String(25), nullable=True)
     setup_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     timeframe: Mapped[Optional[str]] = mapped_column(String(15), nullable=True)
 
@@ -84,7 +84,7 @@ class JournalEntry(Base):
     mistake_tags: Mapped[Optional[list]] = mapped_column(JSON, default=list)
 
     process_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # "GOOD_TRADE" or "BAD_TRADE"
-    outcome_quadrant: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # e.g., "GOOD_PROCESS_BAD_OUTCOME"
+    outcome_quadrant: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     ai_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -98,7 +98,7 @@ class DailyAccountSnapshot(Base):
     __tablename__ = "daily_account_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    trading_date: Mapped[str] = mapped_column(String(10), unique=True, index=True, nullable=False)  # YYYY-MM-DD
+    trading_date: Mapped[str] = mapped_column(String(10), unique=True, index=True, nullable=False)
     day_start_balance: Mapped[float] = mapped_column(Float, nullable=False)
     day_start_equity: Mapped[float] = mapped_column(Float, nullable=False)
     current_balance: Mapped[float] = mapped_column(Float, nullable=False)
@@ -143,20 +143,34 @@ class MacroRegimeSnapshot(Base):
 
 
 class DisciplineAuditLog(Base):
-    """Stores Phase 3 Multimodal TradingView Chart & Pre-Trade Discipline Gatekeeper audits."""
+    """Stores Phase 3.5 Multimodal Chart Strategist (HTF + LTF ICT/Trendline) audits."""
     __tablename__ = "discipline_audits"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
-    proposed_direction: Mapped[str] = mapped_column(String(10), nullable=False)  # "BUY" or "SELL"
+    intent_mode: Mapped[str] = mapped_column(String(20), default="RECOMMEND")  # "RECOMMEND", "BUY", "SELL"
+    proposed_direction: Mapped[str] = mapped_column(String(15), nullable=False)
     timeframe: Mapped[str] = mapped_column(String(15), default="M15")
+    htf_timeframe: Mapped[Optional[str]] = mapped_column(String(15), nullable=True)
     proposed_risk_pct: Mapped[float] = mapped_column(Float, default=0.5)
     setup_description: Mapped[str] = mapped_column(Text, nullable=False)
+
     chart_image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    htf_chart_image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     verdict: Mapped[str] = mapped_column(String(15), nullable=False)  # "PASS", "CAUTION", "BLOCK"
+    recommended_action: Mapped[str] = mapped_column(String(30), default="WAIT")  # "BUY", "SELL", "WAIT"
+    recommended_strategy: Mapped[str] = mapped_column(String(100), default="Wait for Confirmation")
+    confluences_count: Mapped[int] = mapped_column(Integer, default=0)
+    confluences_found: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+
     discipline_score: Mapped[int] = mapped_column(Integer, default=50)  # 0-100
+    htf_bias_read: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     chart_structure_read: Mapped[str] = mapped_column(Text, nullable=False)
+    trendline_ict_critique: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    trigger_to_wait_for: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    invalidation_sl_zone: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     rule_violations: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     coaching_verdict: Mapped[str] = mapped_column(Text, nullable=False)
 

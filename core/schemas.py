@@ -46,6 +46,38 @@ class DrawdownStatus(BaseModel):
     lock_reason: Optional[str] = None
 
 
+class SessionCountdownStatus(BaseModel):
+    """DST-aware trading session status and 30-minute pre-session countdown banner."""
+    current_utc_uae: str
+    active_session: str
+    active_session_label: str
+    is_dead_zone: bool = False
+    next_event_name: str
+    next_event_time_utc_uae: str
+    minutes_until_next: int
+    pre_session_alert_active: bool = False
+    alert_severity: Literal["INFO", "WARNING", "DANGER"] = "INFO"
+    banner_message: str
+
+
+class SymbolVolatilityMetrics(BaseModel):
+    """Live MT5 M15 ATR expansion, tick volume surge, and 14-day ADR exhaustion telemetry."""
+    symbol: str
+    bid_price: float
+    spread_points: int
+    atr_15m_current: float
+    atr_15m_avg20: float
+    atr_expansion_ratio: float
+    volume_current: int
+    volume_avg20: float
+    volume_surge_ratio: float
+    today_range_pips: float
+    adr_14d_pips: float
+    adr_used_pct: float
+    volatility_regime: Literal["DEAD_COMPRESSED", "NORMAL_HEALTHY", "HIGH_EXPANSION"]
+    plain_english_summary: str
+
+
 class TradeJournalSummary(BaseModel):
     """Combined closed trade + two-stage journal payload served to the Streamlit dashboard."""
     mt5_position_id: int
@@ -92,10 +124,10 @@ class OpenPositionSummary(BaseModel):
 
 class Stage1EntryRequest(BaseModel):
     """Fast in-flight entry questionnaire submitted while a trade is open on MT5."""
-    setup_type: str = Field(..., min_length=2, description="Setup pattern name, e.g. '15M Impulse RTB' or 'Liquidity Sweep'.")
+    setup_type: str = Field(..., min_length=2)
     timeframe: str = Field(default="M15")
-    entry_thesis: str = Field(..., min_length=3, description="Why was this trade taken right now?")
-    invalidation_plan: str = Field(..., min_length=2, description="Where is your hard SL and what proves the setup wrong?")
+    entry_thesis: str = Field(..., min_length=3)
+    invalidation_plan: str = Field(..., min_length=2)
     pre_trade_emotion: Literal["CALM", "CONFIDENT", "FOMO", "REVENGE", "HESITANT", "BORED"] = "CALM"
     macro_aligned: bool = True
     entry_chart_path: Optional[str] = None
@@ -103,9 +135,7 @@ class Stage1EntryRequest(BaseModel):
 
 class ProcessOutcomeVerdict(BaseModel):
     """Stage 2 structured verdict grading GOOD_TRADE vs BAD_TRADE regardless of P&L."""
-    process_verdict: Literal["GOOD_TRADE", "BAD_TRADE"] = Field(
-        description="'GOOD_TRADE' if rules, SL, risk <=1%, and entry thesis were respected; 'BAD_TRADE' if rules were broken."
-    )
+    process_verdict: Literal["GOOD_TRADE", "BAD_TRADE"]
     outcome_quadrant: Literal[
         "GOOD_PROCESS_GOOD_OUTCOME",
         "GOOD_PROCESS_BAD_OUTCOME",
@@ -117,50 +147,70 @@ class ProcessOutcomeVerdict(BaseModel):
     emotional_state: Literal["CALM", "CONFIDENT", "FOMO", "REVENGE", "HESITANT", "FRUSTRATED", "NEUTRAL"]
     followed_plan: bool
     mistake_tags: list[str] = Field(default_factory=list)
-    ai_feedback: str = Field(
-        description="Plain-English 3-sentence coaching explanation of why this was a GOOD TRADE or BAD TRADE regardless of profit or loss."
-    )
+    ai_feedback: str
 
 
 class PreTradeAuditReport(BaseModel):
-    """Structured output returned by Phase 3 Multimodal Chart & Discipline Gatekeeper."""
+    """Structured output returned by Phase 3.5 Chart Strategist (HTF + LTF ICT & Trendline Grader)."""
     verdict: Literal["PASS", "CAUTION", "BLOCK"] = Field(
-        description="'PASS' if setup, chart structure, macro bias, news buffer, and risk align; 'CAUTION' for minor friction; 'BLOCK' if any hard rule or blackout is violated."
+        description="'PASS' ONLY when 2+ aligned confluences exist AND zero hard risk/news/HTF conflicts occur; 'CAUTION' if <2 confluences or counter-macro; 'BLOCK' if rule/blackout violated."
     )
-    discipline_score: int = Field(ge=0, le=100, description="0-100 alignment score across chart structure, macro, risk, and historical edge.")
+    recommended_action: Literal["BUY", "SELL", "WAIT"] = Field(
+        description="Concrete directional action recommended from chart structure ('BUY', 'SELL', or 'WAIT')."
+    )
+    recommended_strategy: str = Field(
+        description="Matched playbook setup (e.g., 'ICT Liquidity Sweep + FVG Reversal', 'Trendline Break & Retest', '15M Impulse Continuation', or 'Sit Out — Messy Chop')."
+    )
+    analysis_mode: Literal["DRAWN_CHART_CRITIQUE", "BLANK_CHART_MAPPING", "TEXT_ONLY"] = Field(
+        description="Whether user trendlines/boxes were critiqued ('DRAWN_CHART_CRITIQUE') or clean structure was mapped ('BLANK_CHART_MAPPING')."
+    )
+    confluences_count: int = Field(ge=0, le=6, description="Exact count of independent confluences aligning in the recommended direction.")
+    confluences_found: list[str] = Field(
+        default_factory=list,
+        description="Explicit list of aligned confluences (e.g., '1H Discount + Bullish OB', 'Asian Low Liquidity Sweep + 15m MSS', 'Valid Trendline Break & Retest', '15M Impulse RTB + RSI Bullish Divergence')."
+    )
+    discipline_score: int = Field(ge=0, le=100, description="0-100 overall setup & risk quality score.")
+    htf_bias_read: str = Field(
+        description="Plain-English Higher-Timeframe (1H/4H) dealing range (Premium vs. Discount) and draw on liquidity read."
+    )
     chart_structure_read: str = Field(
-        description="Plain-English 2-3 sentence technical read of the TradingView screenshot (trend, key levels, liquidity, entry/SL placement)."
+        description="Plain-English 2-3 sentence read of the Execution chart (15m/5m) liquidity pools, FVGs, Order Blocks, and momentum."
+    )
+    trendline_ict_critique: str = Field(
+        description="Direct critique of user-drawn trendlines (VALID anchor vs FORCED cutting candles + Trendline Liquidity stop-hunt warning) OR mapped ICT zones if blank."
+    )
+    trigger_to_wait_for: str = Field(
+        description="Exact candle close, sweep, or retest trigger required before clicking Buy/Sell."
+    )
+    invalidation_sl_zone: str = Field(
+        description="Exact structural invalidation price/zone where the Stop Loss belongs to stay within 1% The5ers risk."
     )
     rule_violations: list[str] = Field(
         default_factory=list,
-        description="Specific rule conflicts or warnings (e.g., 'Inside +/-30m USD news blackout', 'Counter to BEARISH Gold macro bias', 'Risk exceeds 1% cap')."
+        description="Specific rule conflicts, drawdown locks, news blackouts, or missing confluences."
     )
     coaching_verdict: str = Field(
-        description="Direct, plain-English 2-sentence action recommendation before clicking Buy/Sell on MT5."
+        description="Direct, plain-English 2-sentence action summary for the trader."
     )
 
 
 class ChatMessage(BaseModel):
-    """Single turn in a debrief or journal-chat conversation."""
     role: Literal["user", "model"]
     content: str
 
 
 class DebriefTurnResponse(BaseModel):
-    """Structured output returned during a post-trade debrief interview."""
     status: Literal["ASKING_FOLLOWUP", "COMPLETED"]
     coach_message: str
     final_entry: Optional[ParsedJournalNote] = None
 
 
 class JournalChatRequest(BaseModel):
-    """Payload for natural-language Q&A against the trader's SQLite journal."""
     messages: list[ChatMessage]
     lookback_days: int = Field(default=60, ge=1, le=365)
 
 
 class EconomicCatalyst(BaseModel):
-    """Single high-impact economic release or central bank speech."""
     event_name: str
     currency: Literal["USD", "EUR", "GBP", "JPY"]
     impact: Literal["HIGH", "MEDIUM"] = "HIGH"
@@ -172,7 +222,6 @@ class EconomicCatalyst(BaseModel):
 
 
 class MacroRegimeReport(BaseModel):
-    """Structured output produced by Phase 2 Macro Agent."""
     regime: Literal["RISK_ON", "RISK_OFF", "RATE_DRIVEN", "EVENT_VOLATILITY"]
     xauusd_bias: Literal["BULLISH", "BEARISH", "NEUTRAL", "VOLATILE_CHOP"]
     eurusd_bias: Literal["BULLISH", "BEARISH", "NEUTRAL", "VOLATILE_CHOP"]
@@ -183,7 +232,6 @@ class MacroRegimeReport(BaseModel):
 
 
 class NewsBlackoutStatus(BaseModel):
-    """Real-time news blackout gatekeeper check against config/risk_rules.yaml buffer."""
     is_blackout_active: bool
     buffer_minutes: int
     active_or_imminent_event: Optional[str] = None

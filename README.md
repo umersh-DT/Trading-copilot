@@ -1,19 +1,20 @@
 # The5ers Multi-Agent Trading Co-Pilot
 
-A modular, multi-agent trading assistant built with **Google Gemini (`google-genai`)**, **MetaTrader 5**, **FastAPI**, and **Streamlit**. Engineered around **The5ers High Stakes** prop firm risk guardrails for trading **XAU/USD**, **EUR/USD**, **GBP/USD**, and **USD/JPY**, featuring full **UTC & UAE (UTC+4)** time localization, resilient multi-model fallback chains, and multimodal TradingView chart vision.
+A modular, multi-agent trading assistant built with **Google Gemini (`google-genai`)**, **MetaTrader 5**, **FastAPI**, and **Streamlit**. Engineered around **The5ers High Stakes** prop firm risk guardrails for trading **XAU/USD**, **EUR/USD**, **GBP/USD**, and **USD/JPY**, featuring full **UTC & UAE (UTC+4)** time localization, DST-aware session countdown alerts, live MT5 ATR/volume volatility tracking, resilient multi-model fallback chains, and dual-chart (`HTF + LTF`) ICT & trendline vision analysis.
 
 ---
 
 ## Architecture & Completed Roadmap
 
-The system separates execution telemetry, interactive coaching, macro catalyst monitoring, and pre/post-trade rule enforcement into specialized agents sharing a local SQLite database:
+The system separates execution telemetry, interactive coaching, macro catalyst monitoring, live session/volatility tracking, and pre/post-trade rule enforcement into specialized agents sharing a local SQLite database:
 
 | Phase | Agent / Module | Resilient Gemini Model Chain | Core Responsibilities | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **Phase 1** | **MT5 Telemetry & Core Journal** (`connectors/mt5_sync.py`, `core/`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Syncs MT5 live open positions and historical closed deals, computes R-multiples, and tracks live daily/static drawdown buffers. | **Complete** |
 | **Phase 1.5** | **Interactive Debrief & Journal Chat** (`agents/journal_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Multi-turn post-trade coaching interviews, fast single-pass natural-language Q&A over SQLite trade history, and deep behavioral leak audits. | **Complete** |
-| **Phase 2** | **Macro & News Radar** (`agents/macro_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Fetches weekly USD/EUR/GBP/JPY economic calendar events, classifies plain-English regimes & biases for XAU/USD + EUR/USD, and enforces +/-30m red-folder news blackouts. | **Complete** |
-| **Phase 3** | **Two-Stage Execution Journal & Discipline Gatekeeper** (`agents/discipline_agent.py`) | `gemini-4-argon` *(Vision)* → `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Polls live MT5 open trades every 15s for an instant **Entry Thesis Questionnaire**, audits TradingView chart screenshots (`PASS` / `CAUTION` / `BLOCK`), and grades closed trades as **GOOD TRADE** vs. **BAD TRADE** regardless of P&L. | **Complete** |
+| **Phase 2** | **Macro & News Radar** (`agents/macro_agent.py`) | `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.5-flash-lite` | Fetches weekly USD/EUR/GBP/JPY economic calendar events, classifies plain-English regimes & biases for XAU/USD + EUR/USD, and enforces `+/-30m` red-folder news blackouts. | **Complete** |
+| **Phase 3** | **Two-Stage Execution Journal & Automatic Process Grader** (`agents/discipline_agent.py`) | `gemini-3.8-flash` → `gemini-3.5-flash-lite` → `gemini-4-hydrogen` | Polls live MT5 open trades every 15s for an instant **Entry Thesis Questionnaire**, automatically grades closed trades as **GOOD TRADE** vs. **BAD TRADE** on close/sync, and reveals full coaching explanations when clicking any row in the trade log. | **Complete** |
+| **Phase 3.5** | **Chart Strategist & Live Session/Volatility Radar** (`agents/discipline_agent.py`, `connectors/mt5_sync.py`) | `gemini-4-argon` *(Vision)* → `gemini-3.8-flash` → `gemini-4-hydrogen` → `gemini-3.5-flash-lite` | Supports **Recommend Strategy** (when unsure) + **Audit BUY/SELL** modes, Dual-Chart (`1H/4H` + `15m/5m`) ICT & Trendline grading (`VALID` vs. `FORCED` + liquidity trap warnings), a **2-Confluence Minimum** rule for `PASS`, DST-aware **30-minute London/NY pre-open alerts** (with optional audio chime), and live MT5 15m ATR/tick-volume/ADR tracking. | **Complete** |
 
 ---
 
@@ -41,15 +42,15 @@ D:\Trading Agent\
 │   ├── models.py                # SQLAlchemy 2.0 ORM tables (Trades, Two-Stage Journal, Drawdown, Macro, Audits)
 │   └── schemas.py               # Pydantic schemas for Structured Outputs & REST API
 ├── connectors/
-│   └── mt5_sync.py              # MetaTrader 5 live open + closed position sync & drawdown calculator
+│   └── mt5_sync.py              # MetaTrader 5 live/closed sync, drawdown engine, DST session radar & ATR/volume tracker
 ├── agents/
-│   ├── journal_agent.py         # Phase 1 & 1.5: Interactive debrief, fast journal chat & leak audit
+│   ├── journal_agent.py         # Phase 1 & 1.5: Interactive debrief, fast journal chat & Good/Bad Trade analytics
 │   ├── macro_agent.py           # Phase 2: Economic calendar, plain-English bias & news blackout
-│   └── discipline_agent.py      # Phase 3: Multimodal chart TA & Good/Bad trade process gatekeeper
+│   └── discipline_agent.py      # Phase 3 & 3.5: Dual-chart ICT/Trendline Strategist & automatic process grader
 ├── api/
-│   └── main.py                  # FastAPI REST backend (port 8000)
+│   └── main.py                  # FastAPI REST backend with MT5 concurrency lock & background auto-grading (port 8000)
 ├── ui/
-│   └── app.py                   # Streamlit 6-tab control center with 15s live polling & UTC/UAE clocks (port 8501)
+│   └── app.py                   # Streamlit 6-tab control center with 15s polling, session chimes & clickable trade log (port 8501)
 ├── start.ps1                    # 1-click PowerShell launcher with automatic port 8000/8501 cleanup
 ├── data/                        # Local SQLite database & uploaded chart screenshots (git-ignored)
 ├── logs/                        # Background FastAPI logs (git-ignored)

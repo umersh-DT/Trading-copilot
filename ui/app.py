@@ -5,12 +5,13 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 UAE_TZ = timezone(timedelta(hours=4))
 
 st.set_page_config(
-    page_title="The5ers Trading Co-Pilot | Phase 3",
+    page_title="The5ers Trading Co-Pilot | Phase 3.5",
     page_icon="🛡️",
     layout="wide",
 )
@@ -32,11 +33,56 @@ def fmt_utc_uae(iso_str: str | None) -> str:
         return iso_str
 
 
+def play_session_chime():
+    """Play a gentle two-tone WebAudio chime when a 30-minute pre-session alert is active."""
+    components.html(
+        """
+        <script>
+        (function() {
+            try {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                const ctx = new AudioCtx();
+                const now = ctx.currentTime;
+                [523.25, 659.25].forEach((freq, idx) => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = "sine";
+                    osc.frequency.setValueAtTime(freq, now + idx * 0.18);
+                    gain.gain.setValueAtTime(0.08, now + idx * 0.18);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.18 + 0.35);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(now + idx * 0.18);
+                    osc.stop(now + idx * 0.18 + 0.36);
+                });
+            } catch (e) {}
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _extract_http_error(exc: requests.HTTPError) -> str:
+    if exc.response is None:
+        return str(exc)
+    try:
+        data = exc.response.json()
+        if isinstance(data, dict) and "detail" in data:
+            return str(data["detail"])
+        return str(data)
+    except Exception:
+        raw_text = (exc.response.text or "").strip()
+        return f"HTTP {exc.response.status_code}: {raw_text or str(exc)}"
+
+
 def api_get(path: str, params: dict | None = None):
     try:
         resp = requests.get(f"{API_BASE_URL}{path}", params=params, timeout=30)
         resp.raise_for_status()
         return resp.json(), None
+    except requests.HTTPError as e:
+        return None, _extract_http_error(e)
     except Exception as e:
         return None, str(e)
 
@@ -47,8 +93,7 @@ def api_post(path: str, json_body: dict | None = None, params: dict | None = Non
         resp.raise_for_status()
         return resp.json(), None
     except requests.HTTPError as e:
-        detail = e.response.json().get("detail", str(e)) if e.response is not None else str(e)
-        return None, detail
+        return None, _extract_http_error(e)
     except Exception as e:
         return None, str(e)
 
@@ -61,6 +106,8 @@ def api_upload_image(uploaded_file) -> tuple[str | None, str | None]:
         resp = requests.post(f"{API_BASE_URL}/charts/upload", files=files, timeout=30)
         resp.raise_for_status()
         return resp.json().get("chart_image_path"), None
+    except requests.HTTPError as e:
+        return None, _extract_http_error(e)
     except Exception as e:
         return None, str(e)
 
@@ -70,6 +117,8 @@ def api_delete(path: str):
         resp = requests.delete(f"{API_BASE_URL}{path}", timeout=30)
         resp.raise_for_status()
         return resp.json(), None
+    except requests.HTTPError as e:
+        return None, _extract_http_error(e)
     except Exception as e:
         return None, str(e)
 
@@ -126,23 +175,33 @@ def regime_badge(regime: str) -> str:
     return mapping.get(regime, regime)
 
 
+def vol_regime_label(regime: str) -> str:
+    mapping = {
+        "DEAD_COMPRESSED": "😴 Quiet / Tight Range",
+        "NORMAL_HEALTHY": "🟢 Healthy Session Flow",
+        "HIGH_EXPANSION": "🔥 High Momentum & Volume",
+    }
+    return mapping.get(regime, regime)
+
+
 # --- Sidebar Controls ---
 with st.sidebar:
     st.title("🛡️ Co-Pilot Controls")
-    st.caption("Phase 3: Two-Stage Journal & Multimodal Gatekeeper")
+    st.caption("Phase 3.5: Chart Strategist & Session Radar")
 
     lookback_days = st.slider("History Lookback (Days)", min_value=7, max_value=180, value=30, step=1)
-    live_poll_enabled = st.toggle("📡 Auto-Poll MT5 Open Trades (15s)", value=True)
+    live_poll_enabled = st.toggle("📡 Auto-Poll MT5 & Sessions (15s)", value=True)
+    sound_alert_enabled = st.toggle("🔔 Sound Chime on 30m Session Alert", value=False)
 
     if st.button("🔄 Sync MetaTrader 5 Now", width="stretch", type="primary"):
-        with st.spinner("Syncing open & closed MT5 positions..."):
+        with st.spinner("Syncing & auto-grading MT5 positions..."):
             sync_data, err = api_post("/sync/mt5", params={"lookback_days": lookback_days})
             if err:
                 st.error(f"Sync failed: {err}")
             else:
                 msg = f"Synced {sync_data['trades_synced']} closed | {sync_data['open_positions_count']} live open"
                 if sync_data.get("auto_verdicts_generated", 0) > 0:
-                    msg += f" | {sync_data['auto_verdicts_generated']} Good/Bad Trade verdicts graded!"
+                    msg += f" | {sync_data['auto_verdicts_generated']} auto-graded!"
                 st.success(msg)
                 st.rerun()
 
@@ -168,7 +227,7 @@ with st.sidebar:
     )
 
 
-# --- Header, News Blackout Banner & Live Drawdown Gauges ---
+# --- Header, Drawdown Soft-Lock & News Blackout Banner ---
 st.title("The5ers High Stakes — Multi-Agent Trading Co-Pilot")
 
 dd_status, dd_err = api_get("/account/drawdown")
@@ -188,10 +247,50 @@ if blackout_status:
 
 
 # ==============================================================================
-# LIVE MT5 OPEN-POSITION WATCHER (15-SECOND AUTO-POLLING FRAGMENT)
+# LIVE SESSION COUNTDOWN, VOLATILITY RADAR & OPEN-POSITION WATCHER (15s POLL)
 # ==============================================================================
 @st.fragment(run_every=15 if live_poll_enabled else None)
-def render_live_open_positions_watcher():
+def render_live_session_and_positions():
+    pulse, pulse_err = api_get("/market/pulse", params={"symbols": "XAUUSD,EURUSD"})
+    if not pulse_err and pulse:
+        sess = pulse["session"]
+        sev = sess.get("alert_severity", "INFO")
+        if sev == "DANGER":
+            st.error(sess["banner_message"])
+        elif sev == "WARNING":
+            st.warning(sess["banner_message"])
+            if sound_alert_enabled and sess.get("pre_session_alert_active"):
+                alert_sig = f"{sess['next_event_name']}_{sess['next_event_time_utc_uae']}"
+                if st.session_state.get("last_chimed_session") != alert_sig:
+                    play_session_chime()
+                    st.session_state["last_chimed_session"] = alert_sig
+        else:
+            st.info(sess["banner_message"])
+
+        vols = pulse.get("volatility", [])
+        if vols:
+            v_cols = st.columns(len(vols))
+            for idx, v in enumerate(vols):
+                with v_cols[idx]:
+                    with st.container(border=True):
+                        vc1, vc2, vc3 = st.columns(3)
+                        vc1.metric(
+                            f"{v['symbol']} Live",
+                            f"{v['bid_price']}",
+                            f"Spread: {v['spread_points']} pts",
+                        )
+                        vc2.metric(
+                            "15m ATR / Volume",
+                            f"{v['atr_expansion_ratio']}x ATR",
+                            f"Vol: {v['volume_surge_ratio']}x avg",
+                        )
+                        vc3.metric(
+                            "Daily Range Used",
+                            f"{v['adr_used_pct']}% ADR",
+                            f"{v['today_range_pips']} / {v['adr_14d_pips']} pips",
+                        )
+                        st.caption(f"**{vol_regime_label(v['volatility_regime'])}:** {v['plain_english_summary']}")
+
     open_positions, open_err = api_get("/positions/open", params={"poll_mt5": True})
     if open_err or not open_positions:
         return
@@ -223,9 +322,9 @@ def render_live_open_positions_watcher():
                     setup_type = c1.selectbox(
                         "Setup Pattern",
                         [
+                            "ICT Liquidity Sweep + FVG",
+                            "Trendline Break & Retest",
                             "15M Impulse Setup",
-                            "London Liquidity Sweep",
-                            "NY Reversal / FVG Retest",
                             "Order Block Bounce",
                             "RSI Divergence",
                             "Breakout / Momentum",
@@ -242,12 +341,12 @@ def render_live_open_positions_watcher():
 
                     entry_thesis = st.text_input(
                         "Why was this trade taken? (Entry Trigger & Confluence)",
-                        placeholder="E.g., Swept Asian session low + 15m bullish engulfing with DXY rejecting resistance.",
+                        placeholder="E.g., Swept Asian session low + 15m MSS + bullish FVG retest.",
                         key=f"s1_thesis_{pos_id}",
                     )
                     invalidation_plan = st.text_input(
                         "Where is your hard Stop Loss and what proves this trade wrong?",
-                        placeholder="E.g., Hard SL placed below sweep wick at 2612.50 (0.5% risk).",
+                        placeholder="E.g., Hard SL below sweep low at 2612.50 (0.5% risk).",
                         key=f"s1_inv_{pos_id}",
                     )
 
@@ -285,7 +384,7 @@ def render_live_open_positions_watcher():
                                     st.rerun()
 
 
-render_live_open_positions_watcher()
+render_live_session_and_positions()
 
 # --- Drawdown Metrics & Gauges ---
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -320,10 +419,10 @@ with g2:
 
 st.divider()
 
-# --- Main 6 Tabs (Phases 1, 1.5, 2, & 3) ---
+# --- Main 6 Tabs (Phases 1, 1.5, 2, & 3.5) ---
 tab_gatekeeper, tab_journal, tab_macro, tab_chat, tab_analytics, tab_audit = st.tabs(
     [
-        "🛡️ Chart & Discipline Gatekeeper",
+        "🛡️ Chart Strategist & Gatekeeper",
         "📓 Two-Stage Trade Log & Verdicts",
         "🌍 Macro & News Radar",
         "💬 Chat With Journal",
@@ -333,23 +432,33 @@ tab_gatekeeper, tab_journal, tab_macro, tab_chat, tab_analytics, tab_audit = st.
 )
 
 # ==============================================================================
-# TAB 1: PHASE 3 MULTIMODAL CHART & DISCIPLINE GATEKEEPER (gemini-4-argon)
+# TAB 1: PHASE 3.5 CHART STRATEGIST (HTF + LTF ICT & TRENDLINE GRADER)
 # ==============================================================================
 with tab_gatekeeper:
-    st.subheader("Pre-Trade Chart & Rule Check (`gemini-4-argon` Multimodal Vision)")
+    st.subheader("Multimodal Chart Strategist (`gemini-4-argon` — ICT & Trendline Grader)")
     st.caption(
-        "Upload your TradingView chart screenshot BEFORE clicking Buy/Sell on MT5. "
-        "The Gatekeeper audits chart structure, The5ers drawdown headroom, +/-30m news blackouts, Macro Radar bias, and your 60-day edge."
+        "Unsure whether to Buy or Sell, or want your trendlines & ICT zones graded? Upload a Higher-Timeframe (1H/4H) "
+        "and/or Execution (15m/5m) screenshot—drawn or blank. Requires 2+ aligned confluences for a green PASS."
     )
 
-    gk_left, gk_right = st.columns([1.1, 1.2], gap="large")
+    gk_left, gk_right = st.columns([1.05, 1.25], gap="large")
 
     with gk_left:
         with st.form("pre_trade_gatekeeper_form"):
+            intent_choice = st.radio(
+                "What do you want the Strategist to do?",
+                [
+                    "🧭 Analyze Chart / Unsure (Recommend Strategy)",
+                    "🟢 Audit My BUY Plan",
+                    "🔴 Audit My SELL Plan",
+                ],
+                horizontal=False,
+            )
+
             r1_c1, r1_c2, r1_c3 = st.columns(3)
             gk_symbol = r1_c1.selectbox("Instrument", ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"])
-            gk_dir = r1_c2.selectbox("Direction", ["BUY", "SELL"])
-            gk_tf = r1_c3.selectbox("Timeframe", ["M5", "M15", "M30", "H1", "H4"], index=1)
+            gk_htf = r1_c2.selectbox("HTF Chart", ["H1", "H4", "D1"], index=0)
+            gk_tf = r1_c3.selectbox("Execution TF", ["M5", "M15", "M30", "H1"], index=1)
 
             gk_risk = st.slider(
                 "Planned Risk Per Trade (% of Account — Max 1.0%)",
@@ -358,34 +467,55 @@ with tab_gatekeeper:
                 value=0.5,
                 step=0.1,
             )
-            gk_desc = st.text_area(
-                "Setup Plan, Entry Price & Stop-Loss Placement",
-                placeholder="E.g., XAUUSD BUY on 15m impulse retest after London sweep. Entry 2624.00, Hard SL 2618.00 (0.5% risk), TP 2636.00.",
-                height=100,
+
+            u_col1, u_col2 = st.columns(2)
+            htf_chart_file = u_col1.file_uploader(
+                "1. Optional: Higher-Timeframe Chart (1H / 4H)",
+                type=["png", "jpg", "jpeg", "webp"],
             )
-            gk_chart = st.file_uploader(
-                "Upload TradingView Chart Screenshot (PNG / JPG)",
-                type=["png", "jpg", "jpeg"],
+            ltf_chart_file = u_col2.file_uploader(
+                "2. Execution Chart (15m / 5m — Drawn or Blank)",
+                type=["png", "jpg", "jpeg", "webp"],
             )
 
-            run_gk = st.form_submit_button("🛡️ Run Pre-Trade Gatekeeper Audit", type="primary", width="stretch")
+            gk_desc = st.text_area(
+                "Notes, Trendline Questions, or Planned Entry/SL (Optional in Recommend Mode)",
+                placeholder="E.g., I drew a descending trendline on 15m—is it valid or a liquidity trap? Tell me which strategy fits right now.",
+                height=85,
+            )
+
+            run_gk = st.form_submit_button("🧠 Analyze Charts & Build Trade Blueprint", type="primary", width="stretch")
 
             if run_gk:
-                if not gk_desc.strip():
-                    st.warning("Describe your entry and stop-loss setup first.")
+                if not htf_chart_file and not ltf_chart_file and not gk_desc.strip():
+                    st.warning("Upload at least one TradingView screenshot or describe your setup first.")
                 else:
-                    with st.spinner("gemini-4-argon is inspecting your chart, macro regime, news buffer, and risk rules..."):
-                        chart_path, up_err = api_upload_image(gk_chart)
-                        if up_err:
-                            st.error(f"Chart upload failed: {up_err}")
+                    if "BUY" in intent_choice:
+                        intent_mode = "BUY"
+                        prop_dir = "BUY"
+                    elif "SELL" in intent_choice:
+                        intent_mode = "SELL"
+                        prop_dir = "SELL"
+                    else:
+                        intent_mode = "RECOMMEND"
+                        prop_dir = "UNSPECIFIED"
+
+                    with st.spinner("gemini-4-argon is grading HTF bias, trendlines, ICT liquidity pools, and live session volatility..."):
+                        htf_path, htf_err = api_upload_image(htf_chart_file)
+                        ltf_path, ltf_err = api_upload_image(ltf_chart_file)
+                        if htf_err or ltf_err:
+                            st.error(f"Chart upload failed: {htf_err or ltf_err}")
                         else:
                             payload = {
                                 "symbol": gk_symbol,
-                                "proposed_direction": gk_dir,
+                                "intent_mode": intent_mode,
+                                "proposed_direction": prop_dir,
                                 "timeframe": gk_tf,
+                                "htf_timeframe": gk_htf,
                                 "proposed_risk_pct": gk_risk,
                                 "setup_description": gk_desc.strip(),
-                                "chart_image_path": chart_path,
+                                "chart_image_path": ltf_path,
+                                "htf_chart_image_path": htf_path,
                             }
                             gk_res, gk_err = api_post("/gatekeeper/audit", json_body=payload)
                             if gk_err:
@@ -394,58 +524,94 @@ with tab_gatekeeper:
                                 st.session_state["latest_gk_audit"] = gk_res
 
     with gk_right:
-        st.subheader("Gatekeeper Verdict")
+        st.subheader("Trade Blueprint & Drawing Critique")
         latest_gk = st.session_state.get("latest_gk_audit")
         if latest_gk:
             rep = latest_gk["report"]
             verdict = rep["verdict"]
             score = rep["discipline_score"]
+            rec_action = rep["recommended_action"]
+            rec_strat = rep["recommended_strategy"]
+            conf_count = rep["confluences_count"]
+            mode_tag = rep["analysis_mode"].replace("_", " ").title()
 
             if verdict == "PASS":
-                st.success(f"### ✅ VERDICT: PASS (Discipline Score: {score}/100)")
+                st.success(f"### ✅ VERDICT: PASS ({conf_count} Confluences | Score: {score}/100)")
             elif verdict == "CAUTION":
-                st.warning(f"### ⚠️ VERDICT: CAUTION (Discipline Score: {score}/100)")
+                st.warning(f"### ⚠️ VERDICT: CAUTION ({conf_count} Confluences | Score: {score}/100)")
             else:
-                st.error(f"### 🛑 VERDICT: BLOCK — DO NOT ENTER (Discipline Score: {score}/100)")
+                st.error(f"### 🛑 VERDICT: BLOCK — DO NOT ENTER (Score: {score}/100)")
 
-            st.info(f"**📈 TradingView Chart Read:**\n\n{rep['chart_structure_read']}")
+            bp1, bp2, bp3 = st.columns(3)
+            bp1.metric("Recommended Play", rec_action)
+            bp2.metric("Matched Strategy", rec_strat)
+            bp3.metric("Vision Mode", mode_tag)
+
+            if rep.get("confluences_found"):
+                st.success(
+                    f"**🧩 Aligned Confluences ({conf_count}):**\n"
+                    + "\n".join(f"- {c}" for c in rep["confluences_found"])
+                )
+
+            with st.container(border=True):
+                st.markdown(f"**🗺️ Higher-Timeframe (HTF) Map:** {rep['htf_bias_read']}")
+                st.markdown(f"**📐 Trendline & ICT Drawing Critique:** {rep['trendline_ict_critique']}")
+                st.markdown(f"**📊 Execution Chart Read:** {rep['chart_structure_read']}")
+
+            t_col1, t_col2 = st.columns(2)
+            with t_col1:
+                st.info(f"**🎯 Exact Trigger to Wait For:**\n\n{rep['trigger_to_wait_for']}")
+            with t_col2:
+                st.info(f"**🛑 Stop-Loss / Invalidation Zone:**\n\n{rep['invalidation_sl_zone']}")
 
             if rep.get("rule_violations"):
-                st.error("**🚨 Rule Conflicts / Warnings:**\n" + "\n".join(f"- {v}" for v in rep["rule_violations"]))
-            else:
-                st.success("**No rule violations or news conflicts detected.**")
+                st.error("**🚨 Warnings / Missing Confluences:**\n" + "\n".join(f"- {v}" for v in rep["rule_violations"]))
 
-            st.markdown(f"**🎯 Coach Action Recommendation:** {rep['coaching_verdict']}")
+            st.markdown(f"**💬 Coach Summary:** {rep['coaching_verdict']}")
         else:
-            st.info("Submit a setup (and optional TradingView screenshot) on the left to get an instant `PASS` / `CAUTION` / `BLOCK` verdict.")
+            st.info(
+                "Upload your 1H/4H and/or 15m TradingView chart on the left to get:\n"
+                "- **Recommended Direction & Playbook Strategy** when you are unsure\n"
+                "- **Trendline Validity & Retail Liquidity Trap Check** on your drawn lines\n"
+                "- **Exact Trigger & Stop-Loss Blueprint** requiring 2+ aligned confluences"
+            )
 
         history_data, _ = api_get("/gatekeeper/history", params={"limit": 5})
         if history_data:
-            with st.expander("Recent Gatekeeper Checks"):
+            with st.expander("Recent Chart Strategist Audits"):
                 for item in history_data:
                     st.markdown(
-                        f"- **{item['verdict']}** ({item['discipline_score']}/100) — `{item['symbol']} {item['direction']}` "
-                        f"({item['timeframe']}, {item['risk_pct']}% risk) at `{item['created_at']}`"
+                        f"- **{item['verdict']}** → Play: `{item['recommended_action']}` ({item['recommended_strategy']}, "
+                        f"{item['confluences_count']} confluences) on `{item['symbol']}` at `{item['created_at']}`"
                     )
 
 # ==============================================================================
-# TAB 2: TWO-STAGE TRADE LOG & GOOD/BAD TRADE PROCESS VERDICTS
+# TAB 2: AUTO-GRADED CLOSED TRADES & CLICK-TO-INSPECT REASON
 # ==============================================================================
 trades_data, trades_err = api_get("/trades", params={"limit": 200, "symbol": symbol_filter})
 trades_data = trades_data or []
+
+# Automatically trigger background grading if any closed trades are still ungraded
+ungraded_count = sum(1 for t in trades_data if not t.get("process_verdict"))
+if ungraded_count > 0 and not st.session_state.get("auto_grade_triggered"):
+    api_post("/trades/auto-grade-pending")
+    st.session_state["auto_grade_triggered"] = True
 
 with tab_journal:
     left_col, right_col = st.columns([1.45, 1.0], gap="large")
 
     with left_col:
-        st.subheader("Closed Trades — Process Verdict vs. Profit/Loss")
+        st.subheader("Closed Trades — Click Any Trade Row to See Why It Was Good or Bad")
+        if ungraded_count > 0:
+            st.caption(f"⏳ Auto-grading {ungraded_count} newly closed trade(s) in the background—refresh in a few seconds if any show 'Grading...'.")
+
         if not trades_data:
             st.warning("No closed trades found. Click **Sync MetaTrader 5 Now** in the sidebar.")
         else:
             df = pd.DataFrame(trades_data)
             df["closed_utc_uae"] = df["close_time"].apply(fmt_utc_uae)
             df["verdict_badge"] = df["process_verdict"].apply(
-                lambda v: "🟢 GOOD TRADE" if v == "GOOD_TRADE" else ("🔴 BAD TRADE" if v == "BAD_TRADE" else "⏳ Pending")
+                lambda v: "🟢 GOOD TRADE" if v == "GOOD_TRADE" else ("🔴 BAD TRADE" if v == "BAD_TRADE" else "⏳ Grading...")
             )
             display_cols = [
                 "mt5_position_id",
@@ -458,10 +624,12 @@ with tab_journal:
                 "setup_type",
                 "session",
             ]
-            st.dataframe(
+            selection_event = st.dataframe(
                 df[display_cols],
                 width="stretch",
                 hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
                 column_config={
                     "mt5_position_id": "MT5 ID",
                     "closed_utc_uae": "Closed — UTC (UAE)",
@@ -485,93 +653,113 @@ with tab_journal:
             st.plotly_chart(fig_eq, width="stretch")
 
     with right_col:
-        st.subheader("Process-Over-Outcome Verdict & Debrief")
+        st.subheader("Why This Trade Was Graded Good or Bad")
         if not trades_data:
-            st.info("Sync MT5 trades on the left to inspect Good/Bad Trade verdicts or run a coaching debrief.")
+            st.info("Sync MT5 trades on the left to view automatic Good/Bad Trade explanations.")
         else:
-            trade_options = {
-                f"#{t['mt5_position_id']} | {t['symbol']} {t['direction']} (${t['net_profit']:+.2f})": t
-                for t in trades_data
-            }
-            selected_label = st.selectbox("Select Closed Trade", list(trade_options.keys()))
-            selected_trade = trade_options[selected_label]
+            # Resolve clicked row from dataframe selection (defaults to most recent closed trade)
+            selected_idx = 0
+            if selection_event and selection_event.selection and selection_event.selection.rows:
+                selected_idx = selection_event.selection.rows[0]
+
+            selected_trade = trades_data[selected_idx]
             pos_id = selected_trade["mt5_position_id"]
 
+            # Execution Summary Header for the Selected Trade
+            sl_disp = f"{selected_trade['stop_loss']}" if selected_trade.get("stop_loss") else "⚠️ None Set"
+            r_disp = f"{selected_trade['r_multiple']:+.2f}R" if selected_trade.get("r_multiple") is not None else "N/A"
+            with st.container(border=True):
+                m1, m2, m3 = st.columns(3)
+                m1.metric(f"Ticket #{pos_id}", f"{selected_trade['symbol']} {selected_trade['direction']}", f"{selected_trade['volume']} lots")
+                m2.metric("Net P&L / R", f"${selected_trade['net_profit']:+.2f}", f"R: {r_disp}")
+                m3.metric("Entry / SL", f"{selected_trade['entry_price']}", f"SL: {sl_disp}")
+                st.caption(f"Closed: `{fmt_utc_uae(selected_trade['close_time'])}` | Session: `{selected_trade.get('session') or 'N/A'}`")
+
             if selected_trade.get("entry_thesis"):
-                st.info(f"**Stage 1 Entry Thesis:** {selected_trade['entry_thesis']}")
+                st.info(f"**📋 Your Stage 1 Entry Thesis:** {selected_trade['entry_thesis']}")
 
             pv = selected_trade.get("process_verdict")
             quad = selected_trade.get("outcome_quadrant") or ""
+            quad_human = {
+                "GOOD_PROCESS_GOOD_OUTCOME": "Good Process + Profitable Outcome",
+                "GOOD_PROCESS_BAD_OUTCOME": "Good Process + Normal Stop-Out Loss",
+                "BAD_PROCESS_GOOD_OUTCOME": "Bad Process + Lucky Profit (High Risk)",
+                "BAD_PROCESS_BAD_OUTCOME": "Bad Process + Loss",
+            }.get(quad, quad)
+
             if pv == "GOOD_TRADE":
                 st.success(
-                    f"**🟢 GOOD TRADE** (`{quad}`) | Setup: `{selected_trade['setup_type']}` | "
-                    f"Session: `{selected_trade['session']}`\n\n{selected_trade.get('ai_feedback', '')}"
+                    f"### 🟢 GOOD TRADE\n"
+                    f"**Classification:** `{quad_human}` | **Setup:** `{selected_trade.get('setup_type') or 'N/A'}`\n\n"
+                    f"**Why:** {selected_trade.get('ai_feedback', 'Followed your trading plan and risk limits.')}"
                 )
             elif pv == "BAD_TRADE":
                 st.error(
-                    f"**🔴 BAD TRADE** (`{quad}`) | Setup: `{selected_trade['setup_type']}` | "
-                    f"Session: `{selected_trade['session']}`\n\n{selected_trade.get('ai_feedback', '')}"
+                    f"### 🔴 BAD TRADE\n"
+                    f"**Classification:** `{quad_human}` | **Setup:** `{selected_trade.get('setup_type') or 'N/A'}`\n\n"
+                    f"**Why:** {selected_trade.get('ai_feedback', 'Broke one or more execution or risk rules.')}"
                 )
-            elif selected_trade.get("ai_feedback"):
-                st.success(f"**Saved Feedback:** {selected_trade['ai_feedback']}")
+            else:
+                st.warning("⏳ **Automatic grading is running in the background...** Click **Sync MetaTrader 5 Now** or refresh in a moment.")
 
-            if st.button("⚖️ Grade Good Trade vs. Bad Trade Now", width="stretch", type="primary"):
-                with st.spinner("Evaluating process discipline regardless of P&L..."):
-                    v_res, v_err = api_post(f"/trades/{pos_id}/verdict")
-                    if v_err:
-                        st.error(v_err)
-                    else:
-                        st.toast(f"Verdict saved: {v_res['process_verdict']}", icon="⚖️")
-                        st.rerun()
+            if selected_trade.get("mistake_tags"):
+                st.caption("**Detected Flags:** " + ", ".join(f"`{tag}`" for tag in selected_trade["mistake_tags"]))
 
-            st.divider()
-            st.caption("Optional: Multi-Turn Interactive Coaching Interview")
-            debrief_key = f"debrief_history_{pos_id}"
-            if debrief_key not in st.session_state:
-                st.session_state[debrief_key] = []
+            with st.expander("🎙️ Optional: Multi-Turn Coaching Debrief or Re-Grade"):
+                debrief_key = f"debrief_history_{pos_id}"
+                if debrief_key not in st.session_state:
+                    st.session_state[debrief_key] = []
 
-            col_b1, col_b2 = st.columns(2)
-            if col_b1.button("🎙️ Start / Reset Interview", width="stretch"):
-                with st.spinner("Coach is reviewing MT5 execution details..."):
-                    res, err = api_post(f"/trades/{pos_id}/debrief", json_body={"conversation": []})
-                    if err:
-                        st.error(err)
-                    else:
-                        st.session_state[debrief_key] = [{"role": "model", "content": res["coach_message"]}]
-                        st.rerun()
-
-            if st.session_state[debrief_key]:
-                if col_b2.button("✅ Finalize & Save Now", width="stretch"):
-                    with st.spinner("Saving structured journal entry..."):
-                        res, err = api_post(
-                            f"/trades/{pos_id}/debrief",
-                            json_body={"conversation": st.session_state[debrief_key], "force_finalize": True},
-                        )
+                col_b1, col_b2 = st.columns(2)
+                if col_b1.button("Start / Reset Interview", key=f"start_db_{pos_id}", width="stretch"):
+                    with st.spinner("Coach is reviewing MT5 execution details..."):
+                        res, err = api_post(f"/trades/{pos_id}/debrief", json_body={"conversation": []})
                         if err:
                             st.error(err)
                         else:
-                            st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
+                            st.session_state[debrief_key] = [{"role": "model", "content": res["coach_message"]}]
                             st.rerun()
 
-                for msg in st.session_state[debrief_key]:
-                    with st.chat_message("assistant" if msg["role"] == "model" else "user"):
-                        st.write(msg["content"])
+                if col_b2.button("Re-Run Auto Verdict", key=f"regrade_{pos_id}", width="stretch"):
+                    with st.spinner("Re-evaluating trade process..."):
+                        _, v_err = api_post(f"/trades/{pos_id}/verdict")
+                        if v_err:
+                            st.error(v_err)
+                        else:
+                            st.rerun()
 
-                with st.form(f"debrief_reply_form_{pos_id}", clear_on_submit=True):
-                    trader_reply = st.text_input("Your answer to the coach...")
-                    send_reply = st.form_submit_button("Send Reply", width="stretch")
-                    if send_reply and trader_reply.strip():
-                        st.session_state[debrief_key].append({"role": "user", "content": trader_reply.strip()})
-                        with st.spinner("Coach is analyzing your response..."):
+                if st.session_state[debrief_key]:
+                    if st.button("✅ Finalize & Save Interview", key=f"fin_db_{pos_id}", width="stretch"):
+                        with st.spinner("Saving structured journal entry..."):
                             res, err = api_post(
                                 f"/trades/{pos_id}/debrief",
-                                json_body={"conversation": st.session_state[debrief_key]},
+                                json_body={"conversation": st.session_state[debrief_key], "force_finalize": True},
                             )
                             if err:
                                 st.error(err)
                             else:
                                 st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
                                 st.rerun()
+
+                    for msg in st.session_state[debrief_key]:
+                        with st.chat_message("assistant" if msg["role"] == "model" else "user"):
+                            st.write(msg["content"])
+
+                    with st.form(f"debrief_reply_form_{pos_id}", clear_on_submit=True):
+                        trader_reply = st.text_input("Your answer to the coach...")
+                        send_reply = st.form_submit_button("Send Reply", width="stretch")
+                        if send_reply and trader_reply.strip():
+                            st.session_state[debrief_key].append({"role": "user", "content": trader_reply.strip()})
+                            with st.spinner("Coach is analyzing your response..."):
+                                res, err = api_post(
+                                    f"/trades/{pos_id}/debrief",
+                                    json_body={"conversation": st.session_state[debrief_key]},
+                                )
+                                if err:
+                                    st.error(err)
+                                else:
+                                    st.session_state[debrief_key].append({"role": "model", "content": res["coach_message"]})
+                                    st.rerun()
 
 # ==============================================================================
 # TAB 3: PHASE 2 MACRO & NEWS RADAR
@@ -780,7 +968,7 @@ with tab_analytics:
                 label_map = {
                     "GOOD_TRADE": "🟢 Good Trade (Clean Process)",
                     "BAD_TRADE": "🔴 Bad Trade (Rule Violation)",
-                    "UNGRADED": "⏳ Ungraded",
+                    "UNGRADED": "⏳ Grading...",
                 }
                 for key, stats in by_pv.items():
                     pv_rows.append(
@@ -831,7 +1019,7 @@ with tab_analytics:
                 fig_quad.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig_quad, width="stretch")
             else:
-                st.info("Grade closed trades in Tab 2 to populate the 4-Quadrant Process Matrix.")
+                st.info("Closed trades will automatically populate the 4-Quadrant Process Matrix once graded.")
 
         st.divider()
         chart_a, chart_b = st.columns(2)

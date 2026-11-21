@@ -1,16 +1,17 @@
 import os
 import shutil
+import threading
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload
 
-from core.database import init_db, get_db, load_risk_rules
+from core.database import SessionLocal, init_db, get_db, load_risk_rules
 from core.models import (
     Trade,
     DailyAccountSnapshot,
@@ -20,12 +21,13 @@ from core.models import (
 )
 from core.schemas import (
     DrawdownStatus,
+    SessionCountdownStatus,
+    SymbolVolatilityMetrics,
     ParsedJournalNote,
     TradeJournalSummary,
     OpenPositionSummary,
     Stage1EntryRequest,
     ProcessOutcomeVerdict,
-    PreTradeAuditReport,
     ChatMessage,
     DebriefTurnResponse,
     JournalChatRequest,
@@ -35,7 +37,7 @@ from core.schemas import (
 from connectors.mt5_sync import MT5SyncConnector
 from agents.journal_agent import TradingJournalAgent
 from agents.macro_agent import MacroCatalystAgent, format_utc_and_uae
-from agents.discipline_agent import DisciplineGatekeeperAgent
+from agents.discipline_agent import DisciplineGatekeeperAgent, is_fx_weekend_closed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("api")
@@ -43,23 +45,52 @@ logger = logging.getLogger("api")
 UPLOAD_DIR = Path("data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+MT5_LOCK = threading.Lock()
+AUTO_GRADE_LOCK = threading.Lock()
+
+
+def _grade_position_ids_background(position_ids: list[int]) -> int:
+    """Safely grade a list of closed MT5 position IDs in its own DB session."""
+    if not position_ids:
+        return 0
+    if not AUTO_GRADE_LOCK.acquire(blocking=False):
+        return 0
+    graded = 0
+    db = SessionLocal()
+    try:
+        gatekeeper = DisciplineGatekeeperAgent()
+        for pos_id in position_ids:
+            try:
+                trade = db.query(Trade).filter(Trade.mt5_position_id == pos_id).first()
+                if trade and trade.status == "CLOSED" and (
+                    not trade.journal_entry or not trade.journal_entry.process_verdict
+                ):
+                    gatekeeper.evaluate_closed_trade_process(db, mt5_position_id=pos_id)
+                    graded += 1
+            except Exception as exc:
+                logger.warning(f"Auto-grade skipped for MT5 #{pos_id}: {exc}")
+    finally:
+        db.close()
+        AUTO_GRADE_LOCK.release()
+    return graded
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    logger.info("Database initialized (Phases 1-3 ready) and FastAPI backend started.")
+    logger.info("Database initialized (Phase 3.5 Auto-Grading & Chart Strategist ready).")
     yield
 
 
 app = FastAPI(
     title="The5ers Multi-Agent Trading Co-Pilot API",
-    version="3.0.0",
+    version="3.5.3",
     lifespan=lifespan,
 )
 
 
 class JournalNoteRequest(BaseModel):
-    raw_notes: str = Field(..., min_length=3, description="Unstructured post-trade reflection or execution notes.")
+    raw_notes: str = Field(..., min_length=3)
 
 
 class DebriefTurnRequest(BaseModel):
@@ -85,87 +116,117 @@ class AuditResponse(BaseModel):
 
 class PreTradeAuditRequest(BaseModel):
     symbol: str = "XAUUSD"
-    proposed_direction: str = "BUY"
+    intent_mode: str = "RECOMMEND"
+    proposed_direction: str = "UNSPECIFIED"
     timeframe: str = "M15"
+    htf_timeframe: Optional[str] = "H1"
     proposed_risk_pct: float = Field(default=0.5, ge=0.05, le=5.0)
-    setup_description: str = Field(..., min_length=3)
+    setup_description: str = ""
     chart_image_path: Optional[str] = None
+    htf_chart_image_path: Optional[str] = None
+
+
+class MarketPulseResponse(BaseModel):
+    session: SessionCountdownStatus
+    volatility: list[SymbolVolatilityMetrics] = Field(default_factory=list)
+    mt5_connected: bool = False
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "phase": "Phase 3 - Two-Stage Journal & Multimodal Discipline Gatekeeper"}
+    return {"status": "ok", "phase": "Phase 3.5 - Auto-Graded Process Verdicts & Chart Strategist"}
 
 
-# ==============================================================================
-# PHASE 1, 1.5 & 3: MT5 LIVE + CLOSED TELEMETRY, TWO-STAGE JOURNAL & ANALYTICS
-# ==============================================================================
+@app.get("/market/pulse", response_model=MarketPulseResponse)
+def get_market_pulse(symbols: str = Query(default="XAUUSD,EURUSD")):
+    connector = MT5SyncConnector()
+    session_info = connector.get_session_countdown_status()
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+    vol_metrics = []
+    connected = False
+    if not is_fx_weekend_closed() and MT5_LOCK.acquire(timeout=1.5):
+        try:
+            connected = connector.connect()
+            if connected:
+                try:
+                    vol_metrics = connector.get_market_volatility(sym_list)
+                finally:
+                    connector.disconnect()
+        finally:
+            MT5_LOCK.release()
+
+    return MarketPulseResponse(
+        session=session_info,
+        volatility=vol_metrics,
+        mt5_connected=connected,
+    )
 
 
 @app.post("/sync/mt5", response_model=SyncResponse)
 def trigger_mt5_sync(lookback_days: int = Query(default=30, ge=1, le=365), db: Session = Depends(get_db)):
-    """
-    Sync live OPEN positions + historical CLOSED deals from MT5, update The5ers drawdown buffers,
-    and automatically run Stage 2 Good/Bad Trade process verdicts on any newly closed trades.
-    """
-    connector = MT5SyncConnector()
-    if not connector.connect():
-        raise HTTPException(
-            status_code=503,
-            detail="Could not connect to MetaTrader 5 terminal. Verify MT5 is open and credentials in .env are valid.",
-        )
-    try:
-        open_positions = connector.sync_open_positions(db)
-        synced_count, newly_closed_ids = connector.sync_closed_trades(db, lookback_days=lookback_days)
-        status = connector.update_drawdown_status(db)
+    with MT5_LOCK:
+        connector = MT5SyncConnector()
+        if not connector.connect():
+            raise HTTPException(
+                status_code=503,
+                detail="Could not connect to MetaTrader 5 terminal. Verify MT5 is open and credentials in .env are valid.",
+            )
+        try:
+            open_positions = connector.sync_open_positions(db)
+            synced_count, needs_verdict_ids = connector.sync_closed_trades(db, lookback_days=lookback_days)
+            status = connector.update_drawdown_status(db)
+        except Exception as exc:
+            logger.exception("MT5 sync error")
+            raise HTTPException(status_code=500, detail=f"MT5 sync error: {exc}")
+        finally:
+            connector.disconnect()
 
-        verdicts_generated = 0
-        if newly_closed_ids:
-            gatekeeper = DisciplineGatekeeperAgent()
-            for pos_id in newly_closed_ids:
-                try:
-                    gatekeeper.evaluate_closed_trade_process(db, mt5_position_id=pos_id)
-                    verdicts_generated += 1
-                except Exception as exc:
-                    logger.warning(f"Auto close verdict skipped for #{pos_id}: {exc}")
+    verdicts_generated = _grade_position_ids_background(needs_verdict_ids[:15])
 
-        return SyncResponse(
-            open_positions_count=len(open_positions),
-            trades_synced=synced_count,
-            auto_verdicts_generated=verdicts_generated,
-            drawdown_status=status,
-        )
-    finally:
-        connector.disconnect()
+    return SyncResponse(
+        open_positions_count=len(open_positions),
+        trades_synced=synced_count,
+        auto_verdicts_generated=verdicts_generated,
+        drawdown_status=status,
+    )
+
+
+@app.post("/trades/auto-grade-pending")
+def trigger_auto_grade_pending(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Queue automatic GOOD_TRADE / BAD_TRADE grading for any ungraded closed trades in SQLite."""
+    pending_ids = MT5SyncConnector.get_ungraded_closed_position_ids(db, limit=15)
+    if pending_ids:
+        background_tasks.add_task(_grade_position_ids_background, pending_ids)
+    return {"queued_count": len(pending_ids), "position_ids": pending_ids}
 
 
 @app.get("/positions/open", response_model=list[OpenPositionSummary])
-def get_live_open_positions(poll_mt5: bool = Query(default=True), db: Session = Depends(get_db)):
-    """
-    Polled every 15 seconds by Streamlit to detect new live MT5 trades the instant they fill
-    and trigger the Stage 1 Entry Questionnaire. Also auto-grades positions that just closed.
-    """
-    if poll_mt5:
-        connector = MT5SyncConnector()
-        if connector.connect():
-            try:
-                open_list = connector.sync_open_positions(db)
-                _, newly_closed_ids = connector.sync_closed_trades(db, lookback_days=7)
-                connector.update_drawdown_status(db)
+def get_live_open_positions(
+    background_tasks: BackgroundTasks,
+    poll_mt5: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    if poll_mt5 and not is_fx_weekend_closed() and MT5_LOCK.acquire(timeout=1.5):
+        try:
+            connector = MT5SyncConnector()
+            if connector.connect():
+                try:
+                    open_list = connector.sync_open_positions(db)
+                    _, needs_verdict_ids = connector.sync_closed_trades(db, lookback_days=7)
+                    connector.update_drawdown_status(db)
+                finally:
+                    connector.disconnect()
 
-                if newly_closed_ids:
-                    gatekeeper = DisciplineGatekeeperAgent()
-                    for pos_id in newly_closed_ids:
-                        try:
-                            gatekeeper.evaluate_closed_trade_process(db, mt5_position_id=pos_id)
-                        except Exception as exc:
-                            logger.warning(f"Auto close verdict failed for #{pos_id}: {exc}")
+                if needs_verdict_ids:
+                    background_tasks.add_task(_grade_position_ids_background, needs_verdict_ids[:10])
 
                 return [OpenPositionSummary(**item) for item in open_list]
-            finally:
-                connector.disconnect()
+        except Exception as exc:
+            logger.warning(f"Live MT5 poll fallback to SQLite cache: {exc}")
+        finally:
+            MT5_LOCK.release()
 
-    # Fallback to cached OPEN trades in SQLite if MT5 terminal is offline
     rows = db.query(Trade).options(joinedload(Trade.journal_entry)).filter(Trade.status == "OPEN").all()
     results = []
     for t in rows:
@@ -195,12 +256,11 @@ def get_live_open_positions(poll_mt5: bool = Query(default=True), db: Session = 
 
 @app.post("/charts/upload")
 def upload_chart_screenshot(file: UploadFile = File(...)):
-    """Save an uploaded TradingView PNG/JPG screenshot locally for multimodal Gemini analysis."""
     ext = Path(file.filename or "chart.png").suffix.lower()
     if ext not in (".png", ".jpg", ".jpeg", ".webp"):
         raise HTTPException(status_code=400, detail="Unsupported image format. Upload PNG, JPG, or WEBP.")
 
-    ts_prefix = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts_prefix = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     safe_name = f"{ts_prefix}_{os.path.basename(file.filename or 'chart.png')}"
     dest_path = UPLOAD_DIR / safe_name
 
@@ -216,7 +276,6 @@ def submit_stage1_entry_questionnaire(
     payload: Stage1EntryRequest,
     db: Session = Depends(get_db),
 ):
-    """Save the in-flight Entry Thesis Questionnaire while a position is open on MT5."""
     try:
         gatekeeper = DisciplineGatekeeperAgent()
         return gatekeeper.submit_stage1_entry(db, mt5_position_id=mt5_position_id, payload=payload)
@@ -229,7 +288,6 @@ def submit_stage1_entry_questionnaire(
 
 @app.post("/trades/{mt5_position_id}/verdict", response_model=ProcessOutcomeVerdict)
 def run_process_outcome_verdict(mt5_position_id: int, db: Session = Depends(get_db)):
-    """Manually trigger or re-run the Stage 2 Good Trade vs. Bad Trade process verdict on a closed trade."""
     try:
         gatekeeper = DisciplineGatekeeperAgent()
         return gatekeeper.evaluate_closed_trade_process(db, mt5_position_id=mt5_position_id)
@@ -242,7 +300,6 @@ def run_process_outcome_verdict(mt5_position_id: int, db: Session = Depends(get_
 
 @app.get("/account/drawdown", response_model=DrawdownStatus)
 def get_drawdown_status(db: Session = Depends(get_db)):
-    """Return latest cached The5ers High Stakes drawdown status from SQLite."""
     rules = load_risk_rules()
     starting_balance = float(rules["account"]["starting_balance"])
     daily_limit_pct = float(rules["drawdown_limits"]["daily_loss_pct"])
@@ -310,7 +367,6 @@ def list_trades(
     symbol: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """Fetch closed trades joined with their Two-Stage Journal & Process Verdicts."""
     query = db.query(Trade).options(joinedload(Trade.journal_entry)).filter(Trade.status == "CLOSED")
     if symbol and symbol != "ALL":
         query = query.filter(Trade.symbol == symbol)
@@ -401,11 +457,6 @@ def run_behavioral_audit(lookback_days: int = Query(default=30, ge=1, le=365), d
     except Exception as exc:
         logger.exception("Failed to run behavioral leak audit")
         raise HTTPException(status_code=500, detail=f"Audit error: {exc}")
-
-
-# ==============================================================================
-# PHASE 2: MACRO & ECONOMIC CALENDAR AGENT
-# ==============================================================================
 
 
 @app.post("/macro/refresh")
@@ -499,33 +550,29 @@ def delete_macro_event(event_id: int, db: Session = Depends(get_db)):
     return {"deleted_id": event_id}
 
 
-# ==============================================================================
-# PHASE 3: MULTIMODAL CHART & DISCIPLINE GATEKEEPER
-# ==============================================================================
-
-
 @app.post("/gatekeeper/audit")
 def run_pre_trade_gatekeeper_audit(payload: PreTradeAuditRequest, db: Session = Depends(get_db)):
-    """Run gemini-4-argon multimodal TradingView chart + risk + macro + edge audit before entry."""
     try:
         gatekeeper = DisciplineGatekeeperAgent()
         return gatekeeper.run_pre_trade_chart_audit(
             db=db,
             symbol=payload.symbol,
+            intent_mode=payload.intent_mode,
             proposed_direction=payload.proposed_direction,
             timeframe=payload.timeframe,
+            htf_timeframe=payload.htf_timeframe,
             proposed_risk_pct=payload.proposed_risk_pct,
             setup_description=payload.setup_description,
             chart_image_path=payload.chart_image_path,
+            htf_chart_image_path=payload.htf_chart_image_path,
         )
     except Exception as exc:
-        logger.exception("Pre-trade gatekeeper audit failed")
-        raise HTTPException(status_code=500, detail=f"Gatekeeper audit error: {exc}")
+        logger.exception("Chart Strategist audit failed")
+        raise HTTPException(status_code=500, detail=f"Chart Strategist error: {exc}")
 
 
 @app.get("/gatekeeper/history")
 def get_gatekeeper_audit_history(limit: int = Query(default=15, ge=1, le=100), db: Session = Depends(get_db)):
-    """Fetch recent pre-trade chart audits."""
     rows = (
         db.query(DisciplineAuditLog)
         .order_by(DisciplineAuditLog.created_at.desc())
@@ -537,13 +584,16 @@ def get_gatekeeper_audit_history(limit: int = Query(default=15, ge=1, le=100), d
             "id": r.id,
             "created_at": format_utc_and_uae(r.created_at),
             "symbol": r.symbol,
+            "intent_mode": r.intent_mode,
             "direction": r.proposed_direction,
             "timeframe": r.timeframe,
+            "htf_timeframe": r.htf_timeframe,
             "risk_pct": r.proposed_risk_pct,
             "verdict": r.verdict,
+            "recommended_action": r.recommended_action,
+            "recommended_strategy": r.recommended_strategy,
+            "confluences_count": r.confluences_count,
             "discipline_score": r.discipline_score,
-            "chart_structure_read": r.chart_structure_read,
-            "rule_violations": r.rule_violations or [],
             "coaching_verdict": r.coaching_verdict,
         }
         for r in rows
