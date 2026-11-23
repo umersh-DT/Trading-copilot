@@ -32,8 +32,19 @@ def fmt_utc_uae_dt(dt: datetime) -> str:
     return f"{utc_dt.strftime('%H:%M')} UTC ({uae_dt.strftime('%H:%M')} UAE)"
 
 
+def fmt_duration_hm(total_minutes: int) -> str:
+    """Format minutes into clean 'Xh Ym' or 'Ym' strings (never raw thousands of minutes)."""
+    mins = max(1, int(total_minutes))
+    hours, rem_mins = divmod(mins, 60)
+    if hours == 0:
+        return f"{rem_mins}m"
+    if rem_mins == 0:
+        return f"{hours}h"
+    return f"{hours}h {rem_mins}m"
+
+
 class MT5SyncConnector:
-    """Connects to MetaTrader 5 terminal, syncs live OPEN + CLOSED positions, tracks drawdown, and measures session volatility."""
+    """Connects to MetaTrader 5 terminal, syncs live OPEN + CLOSED positions, tracks drawdown, and measures session conditions."""
 
     def __init__(self):
         self.login = int(os.getenv("MT5_LOGIN", "0"))
@@ -70,7 +81,7 @@ class MT5SyncConnector:
         mt5.shutdown()
 
     # ==========================================================================
-    # DST-AWARE SESSION RADAR & 30-MINUTE PRE-SESSION COUNTDOWN
+    # DST-AWARE SESSION RADAR & 30-MINUTE PRE-SESSION COUNTDOWN (Xh Ym FORMAT)
     # ==========================================================================
 
     @staticmethod
@@ -78,6 +89,36 @@ class MT5SyncConnector:
         utc_now = now_utc or datetime.now(timezone.utc)
         if utc_now.tzinfo is None:
             utc_now = utc_now.replace(tzinfo=timezone.utc)
+
+        wd = utc_now.weekday()  # Mon=0 ... Fri=4, Sat=5, Sun=6
+        is_weekend = (wd == 5) or (wd == 4 and utc_now.hour >= 22) or (wd == 6 and utc_now.hour < 22)
+
+        if is_weekend:
+            # Next market reopen is Sunday 22:00 UTC
+            days_until_sun = (6 - wd) % 7
+            reopen_utc = (utc_now + timedelta(days=days_until_sun)).replace(
+                hour=22, minute=0, second=0, microsecond=0
+            )
+            if reopen_utc <= utc_now:
+                reopen_utc += timedelta(days=7)
+            mins_until = max(1, int(round((reopen_utc - utc_now).total_seconds() / 60.0)))
+            countdown_str = fmt_duration_hm(mins_until)
+            reopen_str = fmt_utc_uae_dt(reopen_utc)
+            return SessionCountdownStatus(
+                current_utc_uae=fmt_utc_uae_dt(utc_now),
+                active_session="WEEKEND_CLOSED",
+                active_session_label="⏸️ Weekend — Markets Closed",
+                is_dead_zone=True,
+                next_event_name="Market Open (Asia Session)",
+                next_event_time_utc_uae=reopen_str,
+                minutes_until_next=mins_until,
+                pre_session_alert_active=False,
+                alert_severity="INFO",
+                banner_message=(
+                    f"⏸️ **Weekend — Markets Closed** | Market reopens in **{countdown_str}** (`{reopen_str}`). "
+                    f"Great time to review charts and plan next week's levels."
+                ),
+            )
 
         ldn_now = utc_now.astimezone(LONDON_TZ)
         ny_now = utc_now.astimezone(NY_TZ)
@@ -94,7 +135,7 @@ class MT5SyncConnector:
 
         if is_ldn_active and is_ny_active:
             active_session = "LONDON_NY_OVERLAP"
-            active_label = "🔥 London + New York Overlap (Peak Volume)"
+            active_label = "🔥 London + New York Overlap (Peak Activity)"
             is_dead = False
         elif is_ldn_active:
             active_session = "LONDON"
@@ -106,16 +147,16 @@ class MT5SyncConnector:
             is_dead = False
         elif is_asia_active:
             active_session = "ASIA"
-            active_label = "🌏 Asia Session (Range / Liquidity Build)"
+            active_label = "🌏 Asia Session (Range Building)"
             is_dead = False
         else:
             active_session = "DEAD_ZONE"
-            active_label = "⏸️ Post-NY Rollover / Thin Liquidity"
+            active_label = "⏸️ Quiet Rollover Window"
             is_dead = True
 
         milestones = [
             ("London Session Open", ldn_open_utc),
-            ("New York Open (London-NY Overlap)", ny_open_utc),
+            ("New York Open (Peak Overlap)", ny_open_utc),
             ("London Session Close", ldn_close_utc),
             ("New York Close / Rollover", ny_close_utc),
             ("Next London Session Open", ldn_open_utc + timedelta(days=1)),
@@ -123,40 +164,41 @@ class MT5SyncConnector:
         future_milestones = [(name, ts) for name, ts in milestones if ts > utc_now]
         next_name, next_ts = min(future_milestones, key=lambda x: x[1])
         mins_until = max(1, int(round((next_ts - utc_now).total_seconds() / 60.0)))
+        countdown_str = fmt_duration_hm(mins_until)
         next_time_str = fmt_utc_uae_dt(next_ts)
 
         pre_alert = False
         severity = "INFO"
         banner_msg = (
-            f"{active_label} | Next: **{next_name}** at `{next_time_str}` (in **{mins_until} min**)."
+            f"**{active_label}** | Next: **{next_name}** in **{countdown_str}** (`{next_time_str}`)."
         )
 
         if "New York Open" in next_name and mins_until <= 30:
             pre_alert = True
             severity = "WARNING"
             banner_msg = (
-                f"⚡ **NEW YORK SESSION ABOUT TO START IN {mins_until} MIN** (`{next_time_str}`) — "
-                f"London-NY Overlap ahead! Expect sharp volume surges and stop-hunts; tighten risk."
+                f"⚡ **New York Session starts in {countdown_str}** (`{next_time_str}`) — "
+                f"London–NY Overlap ahead! Expect fast moves and stop-hunts; manage risk carefully."
             )
         elif "London Session Open" in next_name and mins_until <= 30:
             pre_alert = True
             severity = "WARNING"
             banner_msg = (
-                f"🔔 **LONDON SESSION ABOUT TO START IN {mins_until} MIN** (`{next_time_str}`) — "
-                f"Get ready! Mark Asian session High/Low liquidity pools and check Macro Radar bias."
+                f"🔔 **London Session starts in {countdown_str}** (`{next_time_str}`) — "
+                f"Get ready! Mark Asian High/Low levels and check today's market direction."
             )
         elif "London Session Close" in next_name and mins_until <= 30:
             pre_alert = True
             severity = "INFO"
             banner_msg = (
-                f"🌇 **LONDON SESSION CLOSING IN {mins_until} MIN** (`{next_time_str}`) — "
-                f"Watch for London profit-taking reversals before NY afternoon session."
+                f"🌇 **London Session closes in {countdown_str}** (`{next_time_str}`) — "
+                f"Watch for profit-taking pullbacks before the New York afternoon."
             )
         elif is_dead:
             severity = "DANGER"
             banner_msg = (
-                f"⚠️ **THIN LIQUIDITY / ROLLOVER WINDOW** — Spreads widen around broker rollover. "
-                f"Next major open: **{next_name}** at `{next_time_str}` (in {mins_until} min)."
+                f"⚠️ **Quiet Rollover Window** — Spreads are wider right now. "
+                f"Next major open: **{next_name}** in **{countdown_str}** (`{next_time_str}`)."
             )
 
         return SessionCountdownStatus(
@@ -173,7 +215,7 @@ class MT5SyncConnector:
         )
 
     # ==========================================================================
-    # LIVE MT5 VOLUME & ATR VOLATILITY TRACKER
+    # PLAIN-ENGLISH LIVE MARKET SPEED & DAILY MOVE LEFT TRACKER
     # ==========================================================================
 
     def get_symbol_volatility(self, symbol: str) -> Optional[SymbolVolatilityMetrics]:
@@ -220,16 +262,21 @@ class MT5SyncConnector:
             1,
         )
         adr_used_pct = round((today_range_pips / adr_14d_pips) * 100.0, 1) if adr_14d_pips > 0 else 0.0
+        room_left_pct = max(0, int(round(100.0 - adr_used_pct)))
 
+        # Non-repetitive, plain-English single-sentence trading guidance
         if atr_ratio < 0.72 and vol_ratio < 0.8:
             regime = "DEAD_COMPRESSED"
-            summary = f"Quiet / Tight Range ({atr_ratio}x ATR, {vol_ratio}x vol) — avoid breakouts; wait for session open."
+            summary = "😴 Quiet market — wait for London/NY volume before entering."
+        elif room_left_pct <= 20:
+            regime = "HIGH_EXPANSION" if (atr_ratio >= 1.35 or vol_ratio >= 1.5) else "NORMAL_HEALTHY"
+            summary = f"⚠️ Only ~{room_left_pct}% of today's typical move is left — take profits quicker and avoid chasing."
         elif atr_ratio >= 1.35 or vol_ratio >= 1.5:
             regime = "HIGH_EXPANSION"
-            summary = f"High Momentum & Volume ({atr_ratio}x ATR, {vol_ratio}x vol) — fast moves; size carefully & respect SL."
+            summary = f"🔥 Fast momentum & heavy volume — stick to your stop loss and don't over-size."
         else:
             regime = "NORMAL_HEALTHY"
-            summary = f"Healthy Session Flow ({atr_ratio}x ATR, {vol_ratio}x vol, {adr_used_pct}% of daily range used)."
+            summary = f"🟢 Clean movement with ~{room_left_pct}% of today's typical range still available."
 
         return SymbolVolatilityMetrics(
             symbol=sym,
@@ -258,7 +305,7 @@ class MT5SyncConnector:
         return results
 
     # ==========================================================================
-    # MT5 OPEN + CLOSED POSITION SYNC & AUTO-GRADING CANDIDATES
+    # MT5 OPEN + CLOSED POSITION SYNC (WITH HISTORY ORDERS SL/TP RECONSTRUCTION)
     # ==========================================================================
 
     def _estimate_sl_risk_usd(self, symbol: str, entry_price: float, stop_loss: Optional[float], volume: float) -> Optional[float]:
@@ -273,6 +320,33 @@ class MT5SyncConnector:
         ticks = price_diff / sym_info.trade_tick_size
         risk_usd = ticks * sym_info.trade_tick_value * volume
         return round(risk_usd, 2)
+
+    def _build_order_sl_tp_map(self, utc_from: datetime, utc_to: datetime) -> dict[int, dict]:
+        orders = mt5.history_orders_get(utc_from, utc_to)
+        if not orders:
+            logger.warning(f"mt5.history_orders_get() returned empty/None: {mt5.last_error()}")
+            return {}
+
+        grouped: dict[int, list] = {}
+        for o in orders:
+            pos_id = getattr(o, "position_id", 0) or 0
+            if pos_id > 0:
+                grouped.setdefault(pos_id, []).append(o)
+
+        sl_tp_map: dict[int, dict] = {}
+        for pos_id, pos_orders in grouped.items():
+            pos_orders.sort(key=lambda x: (getattr(x, "time_setup", 0), getattr(x, "ticket", 0)))
+            sl_values = [round(float(o.sl), 5) for o in pos_orders if getattr(o, "sl", 0) and float(o.sl) > 0]
+            tp_values = [round(float(o.tp), 5) for o in pos_orders if getattr(o, "tp", 0) and float(o.tp) > 0]
+
+            sl_tp_map[pos_id] = {
+                "initial_sl": sl_values[0] if sl_values else None,
+                "final_sl": sl_values[-1] if sl_values else None,
+                "initial_tp": tp_values[0] if tp_values else None,
+                "final_tp": tp_values[-1] if tp_values else None,
+            }
+
+        return sl_tp_map
 
     def sync_open_positions(self, db: Session) -> list[dict]:
         positions = mt5.positions_get()
@@ -346,7 +420,6 @@ class MT5SyncConnector:
 
     @staticmethod
     def get_ungraded_closed_position_ids(db: Session, limit: int = 10) -> list[int]:
-        """Return MT5 position IDs of closed trades that do not yet have a GOOD_TRADE/BAD_TRADE verdict."""
         rows = (
             db.query(Trade)
             .options(joinedload(Trade.journal_entry))
@@ -363,11 +436,6 @@ class MT5SyncConnector:
         return ungraded
 
     def sync_closed_trades(self, db: Session, lookback_days: int = 30) -> tuple[int, list[int]]:
-        """
-        Sync closed round-trip positions from MT5 history.
-        Returns (synced_count, position_ids_needing_automatic_verdict).
-        Every newly closed or still-ungraded closed trade is queued for automatic GOOD/BAD grading.
-        """
         utc_to = datetime.now(timezone.utc) + timedelta(days=1)
         utc_from = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
@@ -375,6 +443,8 @@ class MT5SyncConnector:
         if deals is None:
             logger.warning(f"No deals returned from MT5: {mt5.last_error()}")
             return 0, self.get_ungraded_closed_position_ids(db, limit=10)
+
+        order_sl_tp_map = self._build_order_sl_tp_map(utc_from, utc_to)
 
         positions_map: dict[int, list] = {}
         for d in deals:
@@ -409,7 +479,15 @@ class MT5SyncConnector:
             close_time = datetime.fromtimestamp(last_out.time, tz=timezone.utc)
 
             existing = db.query(Trade).filter(Trade.mt5_position_id == pos_id).first()
-            stop_loss = existing.stop_loss if (existing and existing.stop_loss) else None
+            order_levels = order_sl_tp_map.get(pos_id, {})
+
+            initial_sl = order_levels.get("initial_sl")
+            final_sl = order_levels.get("final_sl")
+            final_tp = order_levels.get("final_tp")
+
+            stop_loss = final_sl or (existing.stop_loss if (existing and existing.stop_loss) else None)
+            take_profit = final_tp or (existing.take_profit if (existing and existing.take_profit) else None)
+
             if not stop_loss and first_in.comment and "sl" in first_in.comment.lower():
                 try:
                     parts = first_in.comment.lower().split("sl")
@@ -417,25 +495,40 @@ class MT5SyncConnector:
                 except (IndexError, ValueError):
                     stop_loss = None
 
-            risk_usd = (
-                existing.risk_amount_usd
-                if (existing and existing.risk_amount_usd)
-                else self._estimate_sl_risk_usd(first_in.symbol, entry_price, stop_loss, total_volume)
+            risk_sl_reference = initial_sl or stop_loss
+            computed_risk_usd = self._estimate_sl_risk_usd(first_in.symbol, entry_price, risk_sl_reference, total_volume)
+            risk_usd = computed_risk_usd if computed_risk_usd is not None else (
+                existing.risk_amount_usd if existing else None
             )
             r_multiple = round(net_profit / risk_usd, 2) if (risk_usd and risk_usd > 0) else None
 
             if existing:
                 was_open = existing.status == "OPEN"
+                sl_was_missing = not existing.stop_loss and bool(stop_loss)
+
                 existing.exit_price = round(exit_price, 5)
+                if stop_loss:
+                    existing.stop_loss = stop_loss
+                if take_profit:
+                    existing.take_profit = take_profit
                 existing.close_time = close_time
                 existing.commission = round(commission, 2)
                 existing.swap = round(swap, 2)
                 existing.gross_profit = round(gross_profit, 2)
                 existing.net_profit = net_profit
+                if risk_usd is not None:
+                    existing.risk_amount_usd = risk_usd
                 existing.r_multiple = r_multiple
                 existing.status = "CLOSED"
 
                 je = existing.journal_entry
+                if sl_was_missing and je and je.process_verdict:
+                    je.process_verdict = None
+                    je.outcome_quadrant = None
+                    je.ai_feedback = None
+                    je.mistake_tags = []
+                    logger.info(f"Recovered SL ({stop_loss}) for MT5 #{pos_id}; queued for re-grading.")
+
                 if was_open or not je or not je.process_verdict:
                     needs_auto_verdict.append(pos_id)
             else:
@@ -447,6 +540,7 @@ class MT5SyncConnector:
                     entry_price=round(entry_price, 5),
                     exit_price=round(exit_price, 5),
                     stop_loss=stop_loss,
+                    take_profit=take_profit,
                     open_time=open_time,
                     close_time=close_time,
                     commission=round(commission, 2),
