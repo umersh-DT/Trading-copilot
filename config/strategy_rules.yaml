@@ -1,0 +1,105 @@
+# Strict Rule Contracts for the 6-Strategy Chart & Setup Advisor Playbook
+# Edit any threshold or checklist rule here without modifying Python code.
+
+global_gates:
+  min_confluences_for_pass: 2
+  max_adr_used_pct_for_breakouts: 80.0
+  asian_box_max_adr_pct: 35.0
+  min_rr_ratio: 2.0
+
+strategies:
+  ICT_LIQUIDITY_SWEEP_FVG:
+    display_name: "1. ICT Liquidity Sweep + MSS + FVG/OB"
+    ideal_condition: "Range reversals & London/NY killzone stop-hunts"
+    mandatory_checklist:
+      - "Liquidity Sweep: Price clearly wicked beyond a prior Asian/London high/low or equal highs/lows."
+      - "Displacement + MSS: Strong impulsive candle breaks opposing swing structure (Market Structure Shift)."
+      - "Unmitigated POI: Price pulls back into a fresh 15m Fair Value Gap (FVG) or Order Block (OB)."
+    disqualifiers:
+      - "Price is still trapped inside the range without sweeping a liquidity pool."
+      - "Break of structure occurred with weak, overlapping candles (no displacement)."
+      - "Over 80% of today's typical daily range (ADR) is already spent."
+    sl_formula: "Just beyond the liquidity sweep wick."
+    tp1_formula: "Internal range liquidity (minimum 1:2 R:R)."
+    tp2_formula: "Opposite session high/low."
+
+  ELLIOTT_WAVE_2_OR_4_PULLBACK:
+    display_name: "2. Elliott Wave 2 / Wave 4 Pullback"
+    ideal_condition: "Early-to-mid trending markets (1H/4H impulse)"
+    mandatory_checklist:
+      - "Prior Impulse: Clear 5-wave Wave 1 (for W2) or extended Wave 3 (for W4) visible on 1H/4H."
+      - "Fib Retracement Depth: Wave 2 holds inside 0.50-0.786 Fib; Wave 4 holds inside 0.236-0.382 Fib."
+      - "LTF Confirmation: 15m structure shift back in the primary impulse direction."
+    disqualifiers:
+      - "Wave 2 breaks past 100% of Wave 1's origin."
+      - "Wave 4 enters the price territory of Wave 1's peak."
+      - "Chasing mid-Wave 3 momentum without waiting for a pullback."
+    sl_formula: "Below Wave 1 origin (for Wave 2) or beyond Wave 4 swing extreme (for Wave 4)."
+    tp1_formula: "Retest of prior Wave 1 or Wave 3 peak."
+    tp2_formula: "-0.272 to -0.618 Fibonacci extension."
+
+  FIB_GOLDEN_ZONE_OVERLAP:
+    display_name: "3. Fibonacci Golden Zone + Institutional Overlap"
+    ideal_condition: "Trending pullbacks on 1H or 15m"
+    mandatory_checklist:
+      - "Clean Swing Anchor: Anchored on a verified impulsive swing High-to-Low (or Low-to-High)."
+      - "Golden Zone Entry: Price is actively inside the 0.618-0.786 Fibonacci retracement zone."
+      - "Institutional Overlap: At least one overlapping FVG, Order Block, 20-EMA, or broken trendline inside the zone."
+    disqualifiers:
+      - "Fibonacci grid anchored on minor choppy noise instead of a clean swing leg."
+      - "Price sliced straight through the 0.786 level with strong momentum candles."
+    sl_formula: "Beyond the 0.886 / 1.00 swing anchor."
+    tp1_formula: "0.00 swing high/low."
+    tp2_formula: "-0.272 Fibonacci extension."
+
+  WAVE_5_EXHAUSTION_REVERSAL:
+    display_name: "4. Wave 5 Exhaustion & RSI Divergence Reversal"
+    ideal_condition: "Stretched trends hitting HTF liquidity or -0.618 extension"
+    mandatory_checklist:
+      - "5-Wave Completion: Clear 5-wave sequence reaching an HTF liquidity pool or -0.618 extension."
+      - "14-Period RSI Divergence: Higher price high with lower RSI high (or lower price low with higher RSI low)."
+      - "LTF Structure Break: 15m MSS breaking the final Wave 5 trendline."
+    disqualifiers:
+      - "Trying to fade a strong Wave 3 before 5 waves complete."
+      - "Entering before 15m structure breaks (catching a falling knife)."
+    sl_formula: "Beyond the Wave 5 extreme wick."
+    tp1_formula: "Prior Wave 4 consolidation zone."
+    tp2_formula: "0.50 Fibonacci retracement of the entire 5-wave move."
+
+  TRENDLINE_BREAK_RETEST:
+    display_name: "5. Trendline Break & Retest"
+    ideal_condition: "Clean multi-touch diagonal channels"
+    mandatory_checklist:
+      - "Valid Geometry: Line touches >= 2 clean swing highs/lows without slicing candle bodies."
+      - "Impulsive Break: Strong full-bodied candle closes decisively across the trendline."
+      - "Retest Rejection: Price retests the broken trendline + FVG/OB and prints a rejection candle."
+    disqualifiers:
+      - "Forced trendline cutting through candle bodies."
+      - "Buying/selling a 3rd or 4th touch bounce on an unbroken trendline (Retail Liquidity Trap)."
+    sl_formula: "Beyond the retest swing candle."
+    tp1_formula: "Minimum 1:2 R:R structural level."
+    tp2_formula: "Origin of the broken trendline."
+
+  ASIAN_RANGE_KILLZONE:
+    display_name: "6. Asian Range Killzone Setup"
+    ideal_condition: "Tight Asian consolidation (< 35% ADR used) into London/NY Open"
+    mandatory_checklist:
+      - "Tight Asia Box: Asian session range is compressed (< 35% of 14-day ADR)."
+      - "Killzone Window: Setup occurs within 30m before to 2h after London Open or NY Open."
+      - "Judas Sweep & Shift: False sweep of one side of the Asian box followed by 15m MSS + FVG back through the range."
+    disqualifiers:
+      - "Asian session already consumed > 50% of daily range."
+      - "Chasing a raw breakout candle without a liquidity sweep or retest."
+    sl_formula: "Beyond the false-sweep wick."
+    tp1_formula: "Opposite edge of the Asian range box."
+    tp2_formula: "-0.272 Fibonacci expansion target."
+
+  SIT_OUT_WAIT:
+    display_name: "Sit Out / Wait"
+    ideal_condition: "Choppy mid-range price action, news blackout, or < 2 confluences"
+    mandatory_checklist:
+      - "Capital Preservation: Wait for price to reach an HTF POI or complete a 15m Market Structure Shift."
+    disqualifiers: []
+    sl_formula: "N/A — No trade."
+    tp1_formula: "N/A — No trade."
+    tp2_formula: "N/A — No trade."

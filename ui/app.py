@@ -185,7 +185,6 @@ def market_speed_label(regime: str) -> str:
 
 
 def spread_status_label(symbol: str, spread_points: int) -> str:
-    # Typical tight spread thresholds on 5-digit FX & 2-digit XAUUSD
     max_normal = 45 if "XAU" in symbol.upper() else 18
     if spread_points > max_normal:
         return f"⚠️ High Spread ({spread_points} pts)"
@@ -338,11 +337,11 @@ def render_live_session_and_positions():
                         "Setup Pattern",
                         [
                             "ICT Liquidity Sweep + FVG",
+                            "Elliott Wave 2 / 4 Pullback",
+                            "Fibonacci Golden Zone Overlap",
+                            "Wave 5 Exhaustion & RSI Divergence",
                             "Trendline Break & Retest",
-                            "15M Impulse Setup",
-                            "Order Block Bounce",
-                            "RSI Divergence",
-                            "Breakout / Momentum",
+                            "Asian Range Killzone Setup",
                             "Impulse / Unplanned",
                         ],
                         key=f"s1_setup_{pos_id}",
@@ -356,12 +355,12 @@ def render_live_session_and_positions():
 
                     entry_thesis = st.text_input(
                         "Why was this trade taken? (Entry Trigger & Confluence)",
-                        placeholder="E.g., Swept Asian session low + 15m structure shift + bullish FVG retest.",
+                        placeholder="E.g., Wave 2 pullback into 0.618 Fib + 15m bullish FVG retest.",
                         key=f"s1_thesis_{pos_id}",
                     )
                     invalidation_plan = st.text_input(
                         "Where is your hard Stop Loss and what proves this trade wrong?",
-                        placeholder="E.g., Hard SL below sweep low at 2612.50 (0.5% risk).",
+                        placeholder="E.g., Hard SL below Wave 1 origin at 3545.00 (0.5% risk).",
                         key=f"s1_inv_{pos_id}",
                     )
 
@@ -447,23 +446,23 @@ tab_gatekeeper, tab_journal, tab_macro, tab_chat, tab_analytics, tab_audit = st.
 )
 
 # ==============================================================================
-# TAB 1: CHART & SETUP ADVISOR (ICT & TRENDLINE GRADER)
+# TAB 1: CHART & SETUP ADVISOR (STRICT 6-STRATEGY RULE CONTRACTS)
 # ==============================================================================
 with tab_gatekeeper:
-    st.subheader("Chart & Setup Advisor — ICT & Trendline Check")
+    st.subheader("Chart & Setup Advisor — Strict Strategy Checklist")
     st.caption(
-        "Unsure whether to Buy or Sell, or want your trendlines and ICT levels checked? Upload a Higher-Timeframe (1H/4H) "
-        "and/or Execution (15m/5m) chart—drawn or blank. At least 2 aligning signals are required for a green PASS."
+        "Upload a Higher-Timeframe (1H/4H) and/or Execution (15m/5m) chart—drawn or blank. "
+        "Every strategy is audited against strict mandatory rules (Elliott Wave, Fibonacci Golden Zone, ICT, Trendlines & Asian Killzones)."
     )
 
-    gk_left, gk_right = st.columns([1.05, 1.25], gap="large")
+    gk_left, gk_right = st.columns([1.0, 1.3], gap="large")
 
     with gk_left:
         with st.form("pre_trade_gatekeeper_form"):
             intent_choice = st.radio(
                 "How should the Advisor check your chart?",
                 [
-                    "🧭 Analyze Chart / Unsure (Recommend Strategy)",
+                    "🧭 Analyze Chart / Unsure (Recommend Best Strategy)",
                     "🟢 Check My BUY Plan",
                     "🔴 Check My SELL Plan",
                 ],
@@ -494,12 +493,12 @@ with tab_gatekeeper:
             )
 
             gk_desc = st.text_area(
-                "Notes, Trendline Questions, or Planned Entry/SL (Optional)",
-                placeholder="E.g., Is my descending trendline on 15m valid or a liquidity trap? Tell me which strategy fits right now.",
+                "Notes, Wave Count, Fib Levels, or Questions (Optional)",
+                placeholder="E.g., Check if Gold is in a Wave 2 pullback into the 0.618 Fib Golden Zone or if my trendline is a trap.",
                 height=85,
             )
 
-            run_gk = st.form_submit_button("🧠 Analyze Charts & Build Trade Plan", type="primary", width="stretch")
+            run_gk = st.form_submit_button("🧠 Check Strategy Rules & Build Plan", type="primary", width="stretch")
 
             if run_gk:
                 if not htf_chart_file and not ltf_chart_file and not gk_desc.strip():
@@ -515,7 +514,7 @@ with tab_gatekeeper:
                         intent_mode = "RECOMMEND"
                         prop_dir = "UNSPECIFIED"
 
-                    with st.spinner("Analyzing your charts, trendlines, liquidity pools, and risk rules..."):
+                    with st.spinner("Auditing Elliott Wave cycle, Fibonacci levels, ICT zones, and strict strategy rules..."):
                         htf_path, htf_err = api_upload_image(htf_chart_file)
                         ltf_path, ltf_err = api_upload_image(ltf_chart_file)
                         if htf_err or ltf_err:
@@ -539,7 +538,7 @@ with tab_gatekeeper:
                                 st.session_state["latest_gk_audit"] = gk_res
 
     with gk_right:
-        st.subheader("Trade Plan & Drawing Check")
+        st.subheader("Strategy Rule Audit & Trade Blueprint")
         latest_gk = st.session_state.get("latest_gk_audit")
         if latest_gk:
             rep = latest_gk["report"]
@@ -553,42 +552,58 @@ with tab_gatekeeper:
             if verdict == "PASS":
                 st.success(f"### ✅ VERDICT: PASS ({conf_count} Signals Aligned | Score: {score}/100)")
             elif verdict == "CAUTION":
-                st.warning(f"### ⚠️ VERDICT: CAUTION ({conf_count} Signal(s) | Score: {score}/100)")
+                st.warning(f"### ⚠️ VERDICT: CAUTION — WAIT FOR TRIGGER ({conf_count} Signal(s) | Score: {score}/100)")
             else:
                 st.error(f"### 🛑 VERDICT: BLOCK — DO NOT ENTER (Score: {score}/100)")
 
             bp1, bp2, bp3 = st.columns(3)
             bp1.metric("Recommended Play", rec_action)
-            bp2.metric("Best Strategy", rec_strat)
+            bp2.metric("Matched Strategy", rec_strat)
             bp3.metric("Chart Check Mode", mode_tag)
+
+            # Strict Strategy Checklist
+            checklist = rep.get("strategy_checklist", [])
+            if checklist:
+                with st.container(border=True):
+                    st.markdown(f"**📋 Mandatory Rule Checklist — {rec_strat}:**")
+                    for item in checklist:
+                        st_code = item.get("status", "MISSING")
+                        icon = "✅" if st_code == "PASS" else ("⏳" if st_code == "MISSING" else "❌")
+                        st.markdown(f"- {icon} **`[{st_code}]` {item.get('rule_name')}:** {item.get('detail')}")
 
             if rep.get("confluences_found"):
                 st.success(
-                    f"**🧩 Aligning Signals ({conf_count}):**\n"
+                    f"**🧩 Aligning Confluences ({conf_count}):**\n"
                     + "\n".join(f"- {c}" for c in rep["confluences_found"])
                 )
 
             with st.container(border=True):
                 st.markdown(f"**🗺️ Higher-Timeframe Map:** {rep['htf_bias_read']}")
-                st.markdown(f"**📐 Trendline & ICT Check:** {rep['trendline_ict_critique']}")
+                st.markdown(f"**🌊 Elliott Wave Cycle Position:** {rep['wave_cycle_read']}")
+                st.markdown(f"**📐 Fibonacci Levels & Golden Zone:** {rep['fib_levels_summary']}")
+                st.markdown(f"**🔍 Trendline & ICT Check:** {rep['trendline_ict_critique']}")
                 st.markdown(f"**📊 Execution Chart Read:** {rep['chart_structure_read']}")
 
-            t_col1, t_col2 = st.columns(2)
-            with t_col1:
-                st.info(f"**🎯 Exact Trigger to Wait For:**\n\n{rep['trigger_to_wait_for']}")
-            with t_col2:
-                st.info(f"**🛑 Stop-Loss Zone:**\n\n{rep['invalidation_sl_zone']}")
+            # Exact Trigger + Stop Loss + TP1 / TP2 Grid
+            st.info(f"**🎯 Exact Trigger to Wait For:** {rep['trigger_to_wait_for']}")
+            lvl1, lvl2, lvl3 = st.columns(3)
+            with lvl1:
+                st.error(f"**🛑 Stop-Loss Zone:**\n\n{rep['invalidation_sl_zone']}")
+            with lvl2:
+                st.success(f"**🎯 Take-Profit 1 (TP1):**\n\n{rep['tp1_zone']}")
+            with lvl3:
+                st.success(f"**🚀 Take-Profit 2 (TP2):**\n\n{rep['tp2_zone']}")
 
             if rep.get("rule_violations"):
-                st.error("**🚨 Warnings / Missing Confirmations:**\n" + "\n".join(f"- {v}" for v in rep["rule_violations"]))
+                st.warning("**⚠️ Rule Violations / Missing Conditions:**\n" + "\n".join(f"- {v}" for v in rep["rule_violations"]))
 
             st.markdown(f"**💬 Advisor Summary:** {rep['coaching_verdict']}")
         else:
             st.info(
-                "Upload your 1H/4H and/or 15m chart on the left to get:\n"
-                "- **Recommended Direction & Strategy** when you are unsure\n"
-                "- **Trendline Validity & Stop-Hunt Trap Check** on your drawn lines\n"
-                "- **Exact Trigger & Stop-Loss Plan** requiring 2+ aligned signals"
+                "Upload your 1H/4H and/or 15m chart on the left to run a **strict rule-by-rule audit** across:\n"
+                "- **Elliott Wave Cycle & Invalidation** (`Wave 2`, `Wave 4`, or `Wave 5` + RSI divergence)\n"
+                "- **Fibonacci Golden Zone (`0.50–0.618–0.786`)** + **`TP1 / TP2` (`-0.272` / `-0.618`)**\n"
+                "- **ICT Liquidity Sweep + FVG/OB**, **Trendline Geometry**, & **Asian Range Killzones**"
             )
 
         history_data, _ = api_get("/gatekeeper/history", params={"limit": 5})
