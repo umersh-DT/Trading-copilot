@@ -14,7 +14,7 @@ from google.genai.errors import APIError
 from PIL import Image
 from sqlalchemy.orm import Session
 
-from core.database import SessionLocal, init_db, load_risk_rules
+from core.database import SessionLocal, init_db, load_risk_rules, load_strategy_rules
 from core.models import (
     Trade,
     JournalEntry,
@@ -61,11 +61,14 @@ def is_fx_weekend_closed(now_utc: Optional[datetime] = None) -> bool:
 
 class DisciplineGatekeeperAgent:
     """
-    Phase 3.5 Agent (Fast Multimodal Chart Strategist + Automatic Process Trade Grader):
+    Chart & Setup Advisor + Automatic Process Trade Grader:
     1. Stage 1 In-Flight Capture: Records entry thesis, invalidation SL, emotion & chart screenshot while OPEN.
-    2. Pre-Trade Chart Strategist (HTF + LTF): Uses gemini-4-argon with 20s per-attempt timeout & JPEG compression.
-    3. Stage 2 Close Verdict (Automatic Trade Grading): Uses fast gemini-3.8-flash with 20s timeout so Good/Bad Trade
-       verdicts complete in ~1.5 seconds and never stall.
+    2. Chart & Setup Advisor (6-Strategy Rule Contracts):
+       - Evaluates Elliott Wave cycle position, Fibonacci Golden Zone (0.50-0.786) & -0.272/-0.618 targets,
+         ICT Liquidity/FVG/OB, Trendline geometry, and Asian Killzone rules from config/strategy_rules.yaml.
+       - Applies deterministic Python post-checks so any [MISSING] checklist rule forces CAUTION
+         and any [FAIL] or hard risk/news/ADR violation forces BLOCK.
+    3. Stage 2 Close Verdict: Automatically grades closed trades as GOOD_TRADE or BAD_TRADE.
     """
 
     def __init__(self):
@@ -74,9 +77,10 @@ class DisciplineGatekeeperAgent:
             raise ValueError("GEMINI_API_KEY is missing from environment variables (.env).")
         self.client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=20_000),
+            http_options=types.HttpOptions(timeout=25_000),
         )
         self.rules = load_risk_rules()
+        self.strategy_rules = load_strategy_rules()
 
     def _infer_session(self, dt: datetime) -> str:
         utc_dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -123,11 +127,6 @@ class DisciplineGatekeeperAgent:
         system_instruction: Optional[str] = None,
         prefer_vision_model: bool = True,
     ):
-        """
-        Fast, resilient Gemini call with strict per-call timeouts and automatic fallback:
-        - Vision calls: gemini-4-argon -> gemini-3.8-flash -> gemini-4-hydrogen -> gemini-3.5-flash-lite
-        - Fast text grading calls: gemini-3.8-flash -> gemini-3.5-flash-lite -> gemini-4-hydrogen
-        """
         if prefer_vision_model:
             attempts = [
                 (PRIMARY_VISION_MODEL, 0.5),
@@ -214,22 +213,15 @@ class DisciplineGatekeeperAgent:
         entry.stage1_completed_at = now_utc
 
         db.commit()
-        logger.info(f"Stage 1 Entry Questionnaire saved for MT5 #{mt5_position_id} ({trade.symbol} {trade.direction}).")
-
         return {
             "mt5_position_id": mt5_position_id,
             "symbol": trade.symbol,
             "direction": trade.direction,
             "stage1_completed_at": format_utc_and_uae(now_utc),
-            "message": "Stage 1 Entry Thesis locked in. Process verdict will auto-generate when MT5 closes this position.",
+            "message": "Entry plan saved. Process grade will generate automatically when MT5 closes this position.",
         }
 
     def evaluate_closed_trade_process(self, db: Session, mt5_position_id: int) -> ProcessOutcomeVerdict:
-        """
-        Fast Stage 2 Process-Over-Outcome Trade Grader (~1.5s response):
-        Compares MT5 execution telemetry & Stage 1 entry thesis against The5ers rules,
-        grading the trade as GOOD_TRADE or BAD_TRADE regardless of whether it made or lost money.
-        """
         trade = db.query(Trade).filter(Trade.mt5_position_id == mt5_position_id).first()
         if not trade:
             raise ValueError(f"Trade with mt5_position_id={mt5_position_id} not found.")
@@ -310,11 +302,94 @@ ENTRY THESIS & NOTES:
         je.ai_feedback = verdict.ai_feedback
 
         db.commit()
-        logger.info(
-            f"Stage 2 Process Verdict saved for MT5 #{mt5_position_id}: "
-            f"{verdict.process_verdict} ({verdict.outcome_quadrant}) | PnL: ${trade.net_profit:+.2f}"
-        )
         return verdict
+
+    def _format_strategy_playbook_for_prompt(self) -> str:
+        strategies = self.strategy_rules.get("strategies", {})
+        lines = []
+        for key, cfg in strategies.items():
+            lines.append(f"### {cfg.get('display_name', key)} (`{key}`)")
+            lines.append(f"- Ideal Condition: {cfg.get('ideal_condition', '')}")
+            lines.append("- Mandatory Checklist (ALL must pass for green PASS):")
+            for item in cfg.get("mandatory_checklist", []):
+                lines.append(f"  * {item}")
+            if cfg.get("disqualifiers"):
+                lines.append("- Instant Disqualifiers (Force BLOCK if triggered):")
+                for dq in cfg.get("disqualifiers", []):
+                    lines.append(f"  * {dq}")
+            lines.append(
+                f"- Levels Formula -> SL: {cfg.get('sl_formula')} | TP1: {cfg.get('tp1_formula')} | TP2: {cfg.get('tp2_formula')}"
+            )
+        return "\n".join(lines)
+
+    def _enforce_deterministic_verdict(
+        self,
+        audit: PreTradeAuditReport,
+        sym: str,
+        allowed_symbols: list[str],
+        proposed_risk_pct: float,
+        max_risk_pct: float,
+        dd_snap: Optional[DailyAccountSnapshot],
+        blackout_active: bool,
+        blackout_msg: str,
+        adr_used_pct: Optional[float],
+    ) -> PreTradeAuditReport:
+        """
+        Deterministic Python Rule Gate:
+        Guarantees that no optimistic AI verdict can bypass hard risk rules, strategy disqualifiers,
+        or incomplete checklist items.
+        """
+        min_confluences = int(self.strategy_rules.get("global_gates", {}).get("min_confluences_for_pass", 2))
+        max_adr_breakout = float(self.strategy_rules.get("global_gates", {}).get("max_adr_used_pct_for_breakouts", 80.0))
+
+        hard_blocks: list[str] = list(audit.rule_violations)
+
+        if sym not in allowed_symbols:
+            hard_blocks.append(f"Instrument {sym} is outside The5ers allowed list ({allowed_symbols}).")
+        if proposed_risk_pct > max_risk_pct:
+            hard_blocks.append(f"Planned risk ({proposed_risk_pct}%) exceeds the {max_risk_pct}% max cap.")
+        if dd_snap and dd_snap.is_locked_out:
+            hard_blocks.append("Account drawdown soft-lock is active — no new trades allowed today.")
+        if blackout_active:
+            hard_blocks.append(f"High-impact news blackout active: {blackout_msg}")
+
+        failed_items = [c for c in audit.strategy_checklist if c.status == "FAIL"]
+        missing_items = [c for c in audit.strategy_checklist if c.status == "MISSING"]
+
+        for f_item in failed_items:
+            msg = f"Disqualifier triggered ({f_item.rule_name}): {f_item.detail}"
+            if msg not in hard_blocks:
+                hard_blocks.append(msg)
+
+        if hard_blocks:
+            audit.verdict = "BLOCK"
+            audit.rule_violations = hard_blocks
+            return audit
+
+        caution_reasons: list[str] = []
+        if missing_items:
+            for m_item in missing_items:
+                caution_reasons.append(f"Waiting for ({m_item.rule_name}): {m_item.detail}")
+        if audit.confluences_count < min_confluences:
+            caution_reasons.append(
+                f"Only {audit.confluences_count} confluence(s) aligned (minimum {min_confluences} required for PASS)."
+            )
+        if audit.recommended_action == "WAIT":
+            caution_reasons.append("No high-probability entry trigger active right now — wait for confirmation.")
+        if adr_used_pct is not None and adr_used_pct > max_adr_breakout:
+            caution_reasons.append(
+                f"{adr_used_pct}% of today's typical daily move is already used — avoid chasing late breakouts."
+            )
+
+        if caution_reasons:
+            audit.verdict = "CAUTION"
+            for r in caution_reasons:
+                if r not in audit.rule_violations:
+                    audit.rule_violations.append(r)
+        else:
+            audit.verdict = "PASS"
+
+        return audit
 
     def run_pre_trade_chart_audit(
         self,
@@ -374,14 +449,16 @@ ENTRY THESIS & NOTES:
 
         mt5_conn = MT5SyncConnector()
         session_status = mt5_conn.get_session_countdown_status(now_utc)
+        adr_used_pct: Optional[float] = None
         if weekend_closed:
-            vol_context = "Weekend Market Closed (Sat/Sun) — live tick volatility skipped; focus on HTF/LTF weekend prep."
+            vol_context = "Weekend Market Closed — focus on HTF/LTF structure and next week's key levels."
         else:
-            vol_context = "MT5 live volatility unavailable (terminal offline)."
+            vol_context = "Live MT5 data unavailable (terminal offline)."
             if mt5_conn.connect():
                 try:
                     sym_vol = mt5_conn.get_symbol_volatility(sym)
                     if sym_vol:
+                        adr_used_pct = sym_vol.adr_used_pct
                         vol_context = sym_vol.model_dump_json()
                 finally:
                     mt5_conn.disconnect()
@@ -398,14 +475,17 @@ ENTRY THESIS & NOTES:
         intent_instruction = (
             "MODE = 'RECOMMEND' (The trader is UNSURE whether to Buy or Sell). "
             "Analyze the chart(s) objectively, pick the highest-probability directional play ('BUY', 'SELL', or 'WAIT'), "
-            "and recommend the exact strategy from their playbook."
+            "and match the single best strategy from the strict playbook below."
             if mode == "RECOMMEND"
-            else f"MODE = 'AUDIT_{mode}' (The trader wants to {mode}). Stress-test whether {mode} is valid or a trap."
+            else f"MODE = 'AUDIT_{mode}' (The trader wants to {mode}). Stress-test whether {mode} satisfies every mandatory rule or fails."
         )
 
+        playbook_rules_text = self._format_strategy_playbook_for_prompt()
+
         prompt = f"""
-You are the Senior ICT, Trendline & Price-Action Chart Strategist for a The5ers High Stakes prop trader.
-Speak in clear, plain, everyday English. Always format any mentioned times as UTC (UAE UTC+4).
+You are the Senior Technical, Elliott Wave, Fibonacci, ICT & Trendline Chart Strategist for a The5ers High Stakes prop trader.
+Speak in clear, plain, everyday English. Never mention AI model names or technical phase numbers.
+Always format any mentioned times as UTC (UAE UTC+4).
 
 {intent_instruction}
 
@@ -414,34 +494,35 @@ TRADER REQUEST:
 - Intent Mode: {mode} | Proposed Direction: {direction}
 - Execution Timeframe: {timeframe} | Higher Timeframe Provided: {htf_timeframe if htf_part else 'None'}
 - Proposed Risk: {proposed_risk_pct}% (Hard Max Cap: {max_risk_pct}%)
-- Market Open Status: {'WEEKEND CLOSED (Saturday/Sunday Prep Mode)' if weekend_closed else 'LIVE MARKET SESSION'}
-- Trader's Notes / Question: \"\"\"{setup_description or 'Analyze my chart and recommend the best strategy.'}\"\"\"
+- Market Open Status: {'WEEKEND CLOSED (Chart Study Mode)' if weekend_closed else 'LIVE MARKET SESSION'}
+- Trader's Notes / Question: \"\"\"{setup_description or 'Analyze my chart, map Elliott Wave & Fibonacci levels, and check all strategy rules.'}\"\"\"
 
 LIVE SESSION, VOLATILITY & GUARDRAIL TELEMETRY:
 1. Session Radar: {session_status.banner_message}
-2. Live MT5 Volatility & Volume ({sym}): {vol_context}
+2. Live Market Activity ({sym}): {vol_context}
 3. The5ers Drawdown Buffer: {json.dumps(dd_context)}
 4. News Blackout Status (+/-30m rule): {blackout.model_dump_json()}
-5. Phase 2 Macro Radar Bias: {json.dumps(macro_context)}
+5. Market Guide Bias: {json.dumps(macro_context)}
 6. Trader's 60-Day Edge on {sym}: {json.dumps(symbol_edge)}
 7. Trader's 60-Day Edge in {current_session}: {json.dumps(session_edge)}
 
-TRADER'S STRATEGY PLAYBOOK (Match the best fit):
-- Strategy A: **ICT Liquidity Sweep + MSS + FVG/OB Reversal**
-- Strategy B: **Trendline Break & Retest**
-- Strategy C: **15M Impulse Continuation (RTB / RTS)**
-- Strategy D: **Sit Out / Wait (`WAIT`)**
+STRICT 6-STRATEGY RULE CONTRACTS (Select the best fit and audit EVERY mandatory rule):
+{playbook_rules_text}
 
-MANDATORY ANALYSIS RULES:
-1. **Top-Down HTF Check (`htf_bias_read`):** Identify Premium vs. Discount dealing range and HTF draw on liquidity.
-2. **Drawn-Chart Critique vs. Blank-Chart Mapping (`analysis_mode` & `trendline_ict_critique`):**
-   - If user drew trendlines/boxes: `analysis_mode='DRAWN_CHART_CRITIQUE'`. Judge VALID vs. FORCED anchor and warn if a multi-touch trendline is a retail liquidity pool likely to be swept.
-   - If blank chart: `analysis_mode='BLANK_CHART_MAPPING'` and map Asian/London highs/lows, FVGs, Order Blocks, and trendlines.
+MANDATORY OUTPUT REQUIREMENTS:
+1. **Top-Down HTF Check (`htf_bias_read`):** Identify Premium vs. Discount dealing range, 20-EMA trend, and HTF draw on liquidity.
+2. **Elliott Wave Cycle Read (`wave_cycle_read`):** Identify the current wave count (e.g., Wave 1-2-3-4-5 impulse or A-B-C correction), whether price is in a Wave 2 (`0.50-0.786`) pullback, Wave 4 (`0.236-0.382`) consolidation, or Wave 5 exhaustion with 14-RSI divergence, and state the exact price level that invalidates the wave count.
+3. **Fibonacci Retracement & Extension Levels (`fib_levels_summary`):** Anchor on the dominant swing High-to-Low (or Low-to-High) — or critique the user's drawn Fib if already plotted on the chart — and list exact price levels for the **0.50–0.618–0.786 Golden Zone**, **-0.272**, and **-0.618** extensions.
+4. **Drawn-Chart Critique vs. Blank-Chart Mapping (`analysis_mode` & `trendline_ict_critique`):**
+   - If user drew trendlines/Fibs/boxes: `analysis_mode='DRAWN_CHART_CRITIQUE'`. Judge VALID vs. FORCED anchor and warn if an unbroken multi-touch trendline is a retail stop-hunt trap.
+   - If blank chart: `analysis_mode='BLANK_CHART_MAPPING'` and map the key highs/lows, FVGs, Order Blocks, and trendlines.
    - If no image: `analysis_mode='TEXT_ONLY'`.
-3. **Strict 2-Confluence Minimum Rule (`confluences_count` & `verdict`):**
-   - `verdict='BLOCK'` if soft-lock is True, news blackout active, risk > {max_risk_pct}%, symbol disallowed, or direction fights clear HTF/ICT reversal.
-   - `verdict='PASS'` ONLY when `confluences_count >= 2` AND zero hard blocks exist AND `recommended_action` is `'BUY'` or `'SELL'`.
-   - Otherwise `verdict='CAUTION'`.
+5. **Rule-by-Rule Strategy Checklist (`strategy_checklist`):**
+   - For the selected `recommended_strategy`, output one `StrategyChecklistItem` per mandatory rule (plus any triggered disqualifier):
+     * `status='PASS'` if clearly confirmed on the chart right now.
+     * `status='MISSING'` if the setup is forming but waiting for that trigger (e.g., price has not yet reached the `0.618` Golden Zone or `15m` MSS has not printed yet).
+     * `status='FAIL'` if a hard disqualifier is broken (e.g., Wave 4 overlaps Wave 1, Forced Trendline, or News Blackout).
+6. **Exact Levels (`invalidation_sl_zone`, `tp1_zone`, `tp2_zone`):** Provide exact price zones for Stop Loss, Take-Profit 1 (`TP1`), and Take-Profit 2 (`TP2`) following the matched strategy's formula.
 """
 
         contents: list = [prompt]
@@ -459,6 +540,18 @@ MANDATORY ANALYSIS RULES:
         )
         audit = PreTradeAuditReport.model_validate_json(raw_json)
 
+        audit = self._enforce_deterministic_verdict(
+            audit=audit,
+            sym=sym,
+            allowed_symbols=allowed_symbols,
+            proposed_risk_pct=proposed_risk_pct,
+            max_risk_pct=max_risk_pct,
+            dd_snap=dd_snap,
+            blackout_active=blackout.is_blackout_active,
+            blackout_msg=blackout.message,
+            adr_used_pct=adr_used_pct,
+        )
+
         log_row = DisciplineAuditLog(
             symbol=sym,
             intent_mode=mode,
@@ -466,7 +559,7 @@ MANDATORY ANALYSIS RULES:
             timeframe=timeframe,
             htf_timeframe=htf_timeframe if htf_part else None,
             proposed_risk_pct=proposed_risk_pct,
-            setup_description=setup_description or "Chart Strategist Recommendation Request",
+            setup_description=setup_description or "Chart & Setup Advisor Request",
             chart_image_path=chart_image_path,
             htf_chart_image_path=htf_chart_image_path,
             verdict=audit.verdict,
@@ -474,12 +567,17 @@ MANDATORY ANALYSIS RULES:
             recommended_strategy=audit.recommended_strategy,
             confluences_count=audit.confluences_count,
             confluences_found=audit.confluences_found,
+            strategy_checklist=[c.model_dump() for c in audit.strategy_checklist],
             discipline_score=audit.discipline_score,
             htf_bias_read=audit.htf_bias_read,
+            wave_cycle_read=audit.wave_cycle_read,
+            fib_levels_summary=audit.fib_levels_summary,
             chart_structure_read=audit.chart_structure_read,
             trendline_ict_critique=audit.trendline_ict_critique,
             trigger_to_wait_for=audit.trigger_to_wait_for,
             invalidation_sl_zone=audit.invalidation_sl_zone,
+            tp1_zone=audit.tp1_zone,
+            tp2_zone=audit.tp2_zone,
             rule_violations=audit.rule_violations,
             coaching_verdict=audit.coaching_verdict,
         )

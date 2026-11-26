@@ -1,3 +1,4 @@
+import math
 import os
 from datetime import datetime, timedelta, timezone
 import requests
@@ -61,6 +62,93 @@ def play_session_chime():
         """,
         height=0,
     )
+
+
+def calculate_the5ers_position_size(
+    symbol: str,
+    account_balance: float,
+    risk_pct: float,
+    entry_price: float,
+    stop_loss: float,
+    tp1_price: float = 0.0,
+    tp2_price: float = 0.0,
+    daily_buffer_remaining_usd: float | None = None,
+    usdjpy_rate: float = 152.0,
+) -> dict:
+    """
+    Calculate exact MT5 lot size (rounded down to 0.01 lots so risk never exceeds cap)
+    and R:R projections for XAUUSD, EURUSD, GBPUSD, and USDJPY.
+    """
+    sym = symbol.upper().strip()
+    stop_dist = abs(entry_price - stop_loss)
+    if stop_dist <= 0 or account_balance <= 0:
+        return {"valid": False, "error": "Entry price and Stop Loss must be different positive numbers."}
+
+    # Standard MT5 contract specs:
+    # - XAUUSD: 1.00 lot = 100 oz ($1.00 price move = $100/lot; 1 pip = $0.10 = $10/lot)
+    # - EURUSD / GBPUSD: 1.00 lot = 100,000 units ($0.0001 pip = $10/lot)
+    # - USDJPY: 1.00 lot = 100,000 USD (0.01 pip = 1,000 JPY / usdjpy_rate per lot)
+    if sym == "XAUUSD":
+        pip_size = 0.10
+        usd_per_price_unit_per_lot = 100.0
+    elif sym == "USDJPY":
+        pip_size = 0.01
+        rate = usdjpy_rate if usdjpy_rate > 0 else (entry_price if entry_price > 50 else 152.0)
+        usd_per_price_unit_per_lot = 100_000.0 / rate
+    else:
+        pip_size = 0.0001
+        usd_per_price_unit_per_lot = 100_000.0
+
+    stop_pips = round(stop_dist / pip_size, 1)
+    risk_per_lot_usd = stop_dist * usd_per_price_unit_per_lot
+
+    target_risk_usd = round(account_balance * (risk_pct / 100.0), 2)
+    capped_by_daily_buffer = False
+    effective_risk_budget = target_risk_usd
+
+    if daily_buffer_remaining_usd is not None and daily_buffer_remaining_usd > 0:
+        # Leave at least a 10% safety cushion inside remaining daily loss buffer
+        safe_daily_cap = round(daily_buffer_remaining_usd * 0.90, 2)
+        if effective_risk_budget > safe_daily_cap:
+            effective_risk_budget = safe_daily_cap
+            capped_by_daily_buffer = True
+
+    raw_lots = effective_risk_budget / risk_per_lot_usd if risk_per_lot_usd > 0 else 0.0
+    # Floor to 0.01 micro-lots so actual risk never exceeds target
+    lots = math.floor(raw_lots * 100.0) / 100.0
+    actual_risk_usd = round(lots * risk_per_lot_usd, 2)
+    actual_risk_pct = round((actual_risk_usd / account_balance) * 100.0, 2)
+
+    is_buy = entry_price > stop_loss
+
+    def _eval_tp(tp_val: float):
+        if not tp_val or tp_val <= 0:
+            return None, None
+        valid_dir = (tp_val > entry_price) if is_buy else (tp_val < entry_price)
+        if not valid_dir:
+            return None, None
+        reward_dist = abs(tp_val - entry_price)
+        rr = round(reward_dist / stop_dist, 2)
+        profit_usd = round(lots * reward_dist * usd_per_price_unit_per_lot, 2)
+        return rr, profit_usd
+
+    tp1_rr, tp1_usd = _eval_tp(tp1_price)
+    tp2_rr, tp2_usd = _eval_tp(tp2_price)
+
+    return {
+        "valid": True,
+        "direction": "BUY" if is_buy else "SELL",
+        "lots": lots,
+        "stop_pips": stop_pips,
+        "target_risk_usd": target_risk_usd,
+        "actual_risk_usd": actual_risk_usd,
+        "actual_risk_pct": actual_risk_pct,
+        "capped_by_daily_buffer": capped_by_daily_buffer,
+        "tp1_rr": tp1_rr,
+        "tp1_usd": tp1_usd,
+        "tp2_rr": tp2_rr,
+        "tp2_usd": tp2_usd,
+    }
 
 
 def _extract_http_error(exc: requests.HTTPError) -> str:
@@ -446,7 +534,7 @@ tab_gatekeeper, tab_journal, tab_macro, tab_chat, tab_analytics, tab_audit = st.
 )
 
 # ==============================================================================
-# TAB 1: CHART & SETUP ADVISOR (STRICT 6-STRATEGY RULE CONTRACTS)
+# TAB 1: CHART & SETUP ADVISOR + THE5ERS POSITION SIZE CALCULATOR
 # ==============================================================================
 with tab_gatekeeper:
     st.subheader("Chart & Setup Advisor — Strict Strategy Checklist")
@@ -537,6 +625,111 @@ with tab_gatekeeper:
                             else:
                                 st.session_state["latest_gk_audit"] = gk_res
 
+        # --- The5ers Position Size (Lot) Calculator Widget ---
+        st.divider()
+        with st.container(border=True):
+            st.markdown("#### 🧮 The5ers Position Size (Lot) Calculator")
+            st.caption(
+                f"Uses your current equity (`${dd_status['current_equity']:,.2f}`) and clamps risk to "
+                f"The5ers' **1.0% max cap** and remaining daily loss buffer (`${dd_status['daily_drawdown_remaining_usd']:,.2f}`)."
+            )
+
+            calc_c1, calc_c2 = st.columns(2)
+            calc_symbol = calc_c1.selectbox(
+                "Pair / Metal",
+                ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"],
+                index=["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"].index(gk_symbol),
+                key="lot_calc_symbol",
+            )
+            calc_risk_pct = calc_c2.number_input(
+                "Risk % (Max 1.0%)",
+                min_value=0.10,
+                max_value=1.00,
+                value=min(1.00, float(gk_risk)),
+                step=0.05,
+                format="%.2f",
+                key="lot_calc_risk_pct",
+            )
+
+            default_prices = {
+                "XAUUSD": (3620.00, 3645.00, 3590.00, 3530.00),
+                "EURUSD": (1.10000, 1.10250, 1.09500, 1.09000),
+                "GBPUSD": (1.29000, 1.29300, 1.28400, 1.27800),
+                "USDJPY": (152.000, 152.350, 151.300, 150.600),
+            }
+            d_entry, d_sl, d_tp1, d_tp2 = default_prices[calc_symbol]
+            step_val = 0.10 if calc_symbol == "XAUUSD" else (0.01 if calc_symbol == "USDJPY" else 0.0001)
+            fmt_str = "%.2f" if calc_symbol == "XAUUSD" else ("%.3f" if calc_symbol == "USDJPY" else "%.5f")
+
+            p1, p2 = st.columns(2)
+            calc_entry = p1.number_input(
+                "Entry Price",
+                min_value=0.0001,
+                value=d_entry,
+                step=step_val,
+                format=fmt_str,
+                key=f"calc_entry_{calc_symbol}",
+            )
+            calc_sl = p2.number_input(
+                "Stop Loss (SL)",
+                min_value=0.0001,
+                value=d_sl,
+                step=step_val,
+                format=fmt_str,
+                key=f"calc_sl_{calc_symbol}",
+            )
+
+            t1, t2 = st.columns(2)
+            calc_tp1 = t1.number_input(
+                "Take-Profit 1 (Optional)",
+                min_value=0.0,
+                value=d_tp1,
+                step=step_val,
+                format=fmt_str,
+                key=f"calc_tp1_{calc_symbol}",
+            )
+            calc_tp2 = t2.number_input(
+                "Take-Profit 2 (Optional)",
+                min_value=0.0,
+                value=d_tp2,
+                step=step_val,
+                format=fmt_str,
+                key=f"calc_tp2_{calc_symbol}",
+            )
+
+            sizing = calculate_the5ers_position_size(
+                symbol=calc_symbol,
+                account_balance=float(dd_status["current_equity"]),
+                risk_pct=float(calc_risk_pct),
+                entry_price=float(calc_entry),
+                stop_loss=float(calc_sl),
+                tp1_price=float(calc_tp1),
+                tp2_price=float(calc_tp2),
+                daily_buffer_remaining_usd=float(dd_status["daily_drawdown_remaining_usd"]),
+            )
+
+            if not sizing["valid"]:
+                st.warning(sizing["error"])
+            else:
+                if sizing["capped_by_daily_buffer"]:
+                    st.warning("⚠️ Risk was automatically reduced so a loss cannot breach your remaining daily drawdown limit.")
+
+                m_lot, m_risk, m_stop = st.columns(3)
+                m_lot.metric("MT5 Lot Size", f"{sizing['lots']:.2f} lots", sizing["direction"])
+                m_risk.metric("Exact Dollar Risk", f"${sizing['actual_risk_usd']:.2f}", f"{sizing['actual_risk_pct']}% of equity")
+                m_stop.metric("Stop Distance", f"{sizing['stop_pips']} pips", f"Target: ${sizing['target_risk_usd']:.2f}")
+
+                if sizing["lots"] < 0.01:
+                    st.error("🛑 Stop loss is too wide for 0.01 micro-lots at this risk %. Tighten your SL or skip this setup.")
+                else:
+                    rr_parts = []
+                    if sizing["tp1_rr"] is not None:
+                        rr_parts.append(f"**TP1:** `{sizing['tp1_rr']}R` (`+${sizing['tp1_usd']:.2f}`)")
+                    if sizing["tp2_rr"] is not None:
+                        rr_parts.append(f"**TP2:** `{sizing['tp2_rr']}R` (`+${sizing['tp2_usd']:.2f}`)")
+                    if rr_parts:
+                        st.success(" | ".join(rr_parts))
+
     with gk_right:
         st.subheader("Strategy Rule Audit & Trade Blueprint")
         latest_gk = st.session_state.get("latest_gk_audit")
@@ -561,7 +754,6 @@ with tab_gatekeeper:
             bp2.metric("Matched Strategy", rec_strat)
             bp3.metric("Chart Check Mode", mode_tag)
 
-            # Strict Strategy Checklist
             checklist = rep.get("strategy_checklist", [])
             if checklist:
                 with st.container(border=True):
@@ -584,7 +776,6 @@ with tab_gatekeeper:
                 st.markdown(f"**🔍 Trendline & ICT Check:** {rep['trendline_ict_critique']}")
                 st.markdown(f"**📊 Execution Chart Read:** {rep['chart_structure_read']}")
 
-            # Exact Trigger + Stop Loss + TP1 / TP2 Grid
             st.info(f"**🎯 Exact Trigger to Wait For:** {rep['trigger_to_wait_for']}")
             lvl1, lvl2, lvl3 = st.columns(3)
             with lvl1:
